@@ -95,6 +95,101 @@ H2026_MaixCAM2_small/
       └─ model_308865_vnpu.axmodel
 ```
 
+### `图传程序/`
+
+电脑端 RTSP 图传接收与录像程序，位于：
+
+```text
+图传程序/maixcam2_ball_complete_system_py313/
+```
+该程序与 MaixCAM2 端程序配套使用。MaixCAM2 负责采集视频并通过 Wi-Fi 推送 RTSP 流，电脑端程序负责接收、显示、录像、截图和回放。
+主要功能：
+- 接收 MaixCAM2 输出的 RTSP 视频流；
+- 实时显示摆杆和钢球画面；
+- 手动开始/停止录像；
+- 将 H.264 视频流直接封装为 MKV，避免重新编码；
+- 网络中断后的自动重连；
+- 测试编号和标签管理；
+- 视频截图；
+- 历史录像浏览和回放。
+
+电脑端程序入口：
+```text
+图传程序/
+└─ maixcam2_ball_complete_system_py313/
+   ├─ README_CN.md
+   └─ pc_receiver/
+      ├─ ball_video_receiver.py
+      ├─ check_environment.py
+      ├─ install_and_run.bat
+      ├─ run.bat
+      ├─ reset_environment.bat
+      ├─ build_exe.bat
+      ├─ requirements.txt
+      └─ README_PYTHON313.txt
+```
+
+电脑端运行环境,电脑端程序使用：
+- Windows 或 Linux；
+- 64 位 CPython 3.13；
+- PySide6；
+- PyAV；
+- NumPy。
+依赖版本见：
+图传程序/maixcam2_ball_complete_system_py313/pc_receiver/requirements.txt
+Windows 下第一次运行：
+进入 pc_receiver 目录
+双击 install_and_run.bat
+该脚本会：
+1. 检查 64 位 Python 3.13；
+2. 创建独立的 .venv313 虚拟环境；
+3. 安装 PySide6、PyAV 和 NumPy；
+4. 检查依赖；
+5. 启动图传接收程序。
+
+后续运行：
+双击 run.bat
+如果虚拟环境损坏：
+双击 reset_environment.bat
+然后重新运行：
+install_and_run.bat
+RTSP 连接
+MaixCAM2 启动 RTSP 后，会输出类似地址：
+rtsp://192.168.137.2:8554/live
+电脑端程序默认使用：
+rtsp://192.168.137.2:8554/live
+如果 MaixCAM2 的 IP 地址发生变化，需要在电脑端程序中修改 RTSP 地址。
+MaixCAM2 与电脑必须连接到同一局域网或同一个热点网络。
+
+图传链路
+```text
+MaixCAM2 摄像头
+    ↓
+MaixCAM2 RTSP 推流
+    ↓ Wi-Fi
+电脑端 RTSP 接收程序
+    ├─ 实时显示
+    ├─ 录像
+    ├─ 截图
+    └─ 视频回放
+```
+MaixCAM2 的视觉识别和 MSPM0G3507 的钢球控制数据链路仍然通过 UART 独立运行：
+MaixCAM2 ── UART4 ── 平衡球控制板
+MaixCAM2 ── Wi-Fi/RTSP ── 电脑图传程序
+因此，电脑端图传程序主要承担观测、录像和回放功能，不直接参与钢球闭环控制。
+
+
+## 视觉控制链路与图传链路的区别
+
+本项目包含两条并行的视频/数据链路：
+
+| 链路 | 作用 | 接收端 |
+|---|---|---|
+| UART 视觉数据链路 | 将钢球位置、速度和目标发送给平衡球控制板，参与实时闭环控制 | MSPM0G3507 |
+| RTSP 图传链路 | 将摄像头画面发送到电脑，用于实时观察、录像和回放 | PC 图传程序 |
+
+UART 链路面向控制，要求低延迟和稳定发送；RTSP 链路面向显示和记录，允许使用较高分辨率的视频编码。
+
 ## 通信接口
 
 ### MaixCAM2 → 平衡球板
@@ -151,10 +246,6 @@ AA 5A seq flags ballN targetN velocity ballX targetX score fps mode checksum
 - ROI 的上下边界；
 - 摆杆左右可达端点对应的像素坐标；
 - 摆杆实际长度与像素到毫米的换算关系。
-
-## 公开仓库注意事项
-
-本仓库的 `.gitignore` 默认忽略 CCS 编译产物、Python 缓存、虚拟环境、测试视频、压缩包和 SolidWorks 工程文件，同时排除当前目录中与 H 题核心实现无关的培训资料。MaixCAM2 的模型文件是否提交取决于文件大小和许可证；如果模型过大，可使用 Git LFS 或在 README 中提供单独获取方式。
 
 ## 相关资料
 

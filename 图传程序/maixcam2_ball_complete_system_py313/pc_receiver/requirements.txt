@@ -1,0 +1,4 @@
+# CPython 3.13 x64 compatible wheels (July 2026)
+PySide6-Essentials==6.11.1
+av==18.0.0
+numpy==2.5.1
