@@ -156,19 +156,8 @@ AA 5A seq flags ballN targetN velocity ballX targetX score fps mode checksum
 
 本仓库的 `.gitignore` 默认忽略 CCS 编译产物、Python 缓存、虚拟环境、测试视频、压缩包和 SolidWorks 工程文件，同时排除当前目录中与 H 题核心实现无关的培训资料。MaixCAM2 的模型文件是否提交取决于文件大小和许可证；如果模型过大，可使用 Git LFS 或在 README 中提供单独获取方式。
 
-## 个人负责内容
-
-主要负责项目的电控与视觉开发，包括：
-
-- 双 MSPM0G3507 控制板的软件架构与协同控制；
-- 循迹、车轮速度闭环和运动状态机；
-- 平衡球位置闭环、丝杆执行器控制和加速度前馈；
-- MaixCAM2 的 YOLO 钢球检测、位置/速度跟踪和串口数据发送；
-- 双板通信协议、起步预倾、异常保护和 RTSP 实时图传。
-
 ## 相关资料
 
-- `f493ffecb6efda69a3bd3fafbc8a88c2.pdf`：赛题原文；
 - `pinghengqiu/pinghengqiu/README_REQ3_PB4_PRETILT_CN.txt`：要求3和起步预倾说明；
 - `pinghengqiu/pinghengqiu/README_REQ3_LATE_BRAKE_RECOVERY_V2_CN.txt`：要求3后期制动与卡滞恢复说明；
 - `H2026_MaixCAM2_small/H2026_MaixCAM2_YOLO244_ROI_UART60/maixcam2_app/README_CN.md`：视觉、UART 和 RTSP 说明。

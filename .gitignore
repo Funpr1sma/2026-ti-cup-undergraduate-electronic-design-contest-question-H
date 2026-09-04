@@ -71,4 +71,7 @@ ov2640/
 *.3mf
 *.SLDPRT
 
-# 赛题 PDF 默认不忽略，便于 README 中引用和复现项目背景
+# 不上传赛题和 8 路循迹模块资料
+/8路巡线模块的使用方法.pdf
+/f493ffecb6efda69a3bd3fafbc8a88c2.pdf
+
