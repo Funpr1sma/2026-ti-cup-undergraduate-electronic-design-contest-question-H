@@ -1,0 +1,21 @@
+id: ball_yolo244_roi_uart60
+name: Ball YOLO244 ROI UART60
+name[zh]: 钢球YOLO244轨道检测与高速串口
+version: 2.0.0
+author: user
+icon: null
+desc: >-
+  MaixCAM2 YOLOv5 244x244 rail ROI detection, velocity estimation, RTSP and
+  UART4 output
+exclude:
+  - __pycache__
+  - build
+  - dist
+  - .gitignore
+files:
+  - app.yaml
+  - main.py
+  - model_308865_npu.axmodel
+  - model_308865_vnpu.axmodel
+  - model_308865.mud
+  - README_CN.md

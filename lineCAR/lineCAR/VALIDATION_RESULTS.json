@@ -1,0 +1,96 @@
+{
+  "revision": "pb4_default_level_and_synchronized_start_pretilt",
+  "syntax_checks": {
+    "balance/CarMotionRx.c": "PASS clang -std=c11 -Wall -Wextra -Werror with MCU API stubs",
+    "balance/VofaTuning.c": "PASS clang -std=c11 -Wall -Wextra -Werror with MCU API stubs",
+    "car/CarMotionLink.c": "PASS clang -std=c11 -Wall -Wextra -Werror with MCU API stubs",
+    "car/Hardware/CarControl.c": "PASS clang -std=c11 -Wall -Wextra -Werror with MCU API stubs",
+    "car/Hardware/VofaTuning.c": "PASS clang -std=c11 -Wall -Wextra -Werror with MCU API stubs",
+    "car/lineCAR.c": "PASS clang -std=c11 -Wall -Wextra -Werror with MCU API stubs"
+  },
+  "source_checks": {
+    "pb4_calls_default_level_move": true,
+    "pb4_level_move_stops_balance_and_remote": true,
+    "level_move_auto_zero": true,
+    "motorstatus_command": true,
+    "home_command_alias": true,
+    "default_level_config_macro": true,
+    "car_pretilt_state": true,
+    "car_wheels_stopped_during_pretilt": true,
+    "car_sends_pretilt_flag_and_acceleration": true,
+    "balance_accepts_pretilt_feedforward": true,
+    "pretilt_ack_bit_synchronized": true,
+    "balance_waits_for_motor_reached": true,
+    "car_min_pretilt_220ms": true,
+    "car_max_pretilt_450ms": true,
+    "ready_held_during_pretilt": true,
+    "no_reserved_bit4_left": true
+  },
+  "protocol_examples": {
+    "pretilt_req45_hex": "A5 5A 07 1C 00 00 DC 00 FE",
+    "pretilt_req45_checksum_ok": true,
+    "pretilt_req6_hex": "A5 5A 08 3C 00 00 DC 00 1F",
+    "pretilt_req6_checksum_ok": true,
+    "base_ready_ack_status": "0x0F",
+    "pretilt_ready_ack_status": "0x2F"
+  },
+  "unchanged_control_sources": {
+    "balance": {
+      "ball_balance_control.c": {
+        "original": "9d85056f1be894f9c0ddbec90b7947440df60a15a163a61597e405e27c962e44",
+        "modified": "9d85056f1be894f9c0ddbec90b7947440df60a15a163a61597e405e27c962e44",
+        "same": true
+      },
+      "closed_loop.c": {
+        "original": "df6396a94036c38fe7935aa6b6973adf5b3a36ebd1809e072d4f174ba6beb386",
+        "modified": "df6396a94036c38fe7935aa6b6973adf5b3a36ebd1809e072d4f174ba6beb386",
+        "same": true
+      },
+      "motor.c": {
+        "original": "1935af559c601e3db912fba5c616e8710dd7297922ffd216aeb5f9847dad59c5",
+        "modified": "1935af559c601e3db912fba5c616e8710dd7297922ffd216aeb5f9847dad59c5",
+        "same": true
+      },
+      "encoder.c": {
+        "original": "c5bf1e76f17cf91e783482b3746d547b0a3d77239d43ac9582037eb1994b5428",
+        "modified": "c5bf1e76f17cf91e783482b3746d547b0a3d77239d43ac9582037eb1994b5428",
+        "same": true
+      },
+      "Req4VisualControl.c": {
+        "original": "8b94c36a22da9c4f36390b84d950348bf8acd1ae6090bc7e7554dbf96d79e50d",
+        "modified": "8b94c36a22da9c4f36390b84d950348bf8acd1ae6090bc7e7554dbf96d79e50d",
+        "same": true
+      }
+    },
+    "car": {
+      "Hardware/LineFollow.c": {
+        "original": "ed07d9c0598d917a4e4171d94bab658727ad9d33eedabe9e4ff1974abd3a6c6e",
+        "modified": "ed07d9c0598d917a4e4171d94bab658727ad9d33eedabe9e4ff1974abd3a6c6e",
+        "same": true
+      },
+      "Hardware/SpeedPI.c": {
+        "original": "1aaa894164fe6150c1c38e943b1a0e8d30eff0ef7b288ff3c2dcfc73f65420c3",
+        "modified": "1aaa894164fe6150c1c38e943b1a0e8d30eff0ef7b288ff3c2dcfc73f65420c3",
+        "same": true
+      },
+      "Hardware/Motor.c": {
+        "original": "5fb67456b30c280e38a7d647fe2128691ea1ad384cec2077c1ffb07487dfbb19",
+        "modified": "5fb67456b30c280e38a7d647fe2128691ea1ad384cec2077c1ffb07487dfbb19",
+        "same": true
+      },
+      "Hardware/GraySensor.c": {
+        "original": "1f02ca9cf7b3c5c0ab6a8e868991ab4f5bc1f09abe4f1c8f15de519c9644831f",
+        "modified": "1f02ca9cf7b3c5c0ab6a8e868991ab4f5bc1f09abe4f1c8f15de519c9644831f",
+        "same": true
+      },
+      "MotionPlanner.c": {
+        "original": "0d3fdebbb3bb3e874989611495d52f93cc33871fdce7a28b1014ef41bf6fa65a",
+        "modified": "0d3fdebbb3bb3e874989611495d52f93cc33871fdce7a28b1014ef41bf6fa65a",
+        "same": true
+      }
+    }
+  },
+  "known_constraint": "Default raw position is relative to the encoder position at MCU reset; repeatable absolute homing needs a limit/home switch or persistent multi-turn reference.",
+  "all_source_checks_passed": true,
+  "all_selected_unrelated_sources_unchanged": true
+}

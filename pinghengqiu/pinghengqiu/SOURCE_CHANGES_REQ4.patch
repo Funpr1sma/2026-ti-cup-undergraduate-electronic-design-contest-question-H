@@ -1,0 +1,1502 @@
+diff -ruN '--exclude=Debug' balance/pinghengqiu/CarMotionRx.c pinghengqiu_req4/CarMotionRx.c
+--- balance/pinghengqiu/CarMotionRx.c	1970-01-01 00:00:00.000000000 +0000
++++ pinghengqiu_req4/CarMotionRx.c	2026-08-01 03:43:56.658709876 +0000
+@@ -0,0 +1,384 @@
++#include "CarMotionRx.h"
++
++#include <math.h>
++#include <string.h>
++
++#include "clock.h"
++#include "ti_msp_dl_config.h"
++
++#define CAR_MOTION_RX_DRAIN_LIMIT             (64U)
++#define CAR_MOTION_RX_LINK_TIMEOUT_MS         (120U)
++#define CAR_MOTION_RX_PROCESS_PERIOD_MS       (20U)
++#define CAR_MOTION_RX_GRAVITY_MPS2            (9.80665f)
++#define CAR_MOTION_RX_RAD_TO_DEG              (57.2957795f)
++#define CAR_MOTION_RX_FILTER_ALPHA            (0.45f)
++#define CAR_MOTION_RX_DECAY_ALPHA             (0.60f)
++
++/* Requirement-4 defaults. All can be changed over UART0. */
++#define CAR_MOTION_RX_DEFAULT_GAIN            (0.85f)
++#define CAR_MOTION_RX_DEFAULT_LIMIT_DEG       (1.20f)
++#define CAR_MOTION_RX_DEFAULT_DEADBAND_MPS2   (0.015f)
++#define CAR_MOTION_RX_DEFAULT_DIRECTION       (-1)
++
++typedef struct {
++    uint8_t buffer[CAR_MOTION_RX_FRAME_SIZE];
++    uint8_t index;
++    uint8_t last_sequence;
++    uint8_t has_sequence;
++
++    volatile uint8_t sequence;
++    volatile uint8_t flags;
++    volatile int16_t planned_cps;
++    volatile int16_t acceleration_mm_s2;
++    volatile uint32_t last_frame_ms;
++    volatile uint32_t frame_generation;
++
++    uint32_t last_process_ms;
++    float filtered_acceleration_mps2;
++    float feedforward_angle_deg;
++    float gain;
++    float angle_limit_deg;
++    float deadband_mps2;
++    int8_t direction_sign;
++
++    volatile uint32_t valid_frame_count;
++    volatile uint32_t checksum_error_count;
++    volatile uint32_t duplicate_frame_count;
++    volatile uint32_t rx_byte_count;
++    volatile uint32_t irq_count;
++    volatile uint32_t poll_drain_count;
++} CarMotionRxContext_t;
++
++static CarMotionRxContext_t s_rx;
++
++static float CarMotionRx_Abs(float value)
++{
++    return (value < 0.0f) ? -value : value;
++}
++
++static float CarMotionRx_Limit(float value, float minimum, float maximum)
++{
++    if (value < minimum) {
++        return minimum;
++    }
++    if (value > maximum) {
++        return maximum;
++    }
++    return value;
++}
++
++static int16_t CarMotionRx_ReadI16(const uint8_t *data)
++{
++    uint16_t raw = (uint16_t)data[0] | ((uint16_t)data[1] << 8U);
++    return (int16_t)raw;
++}
++
++static uint8_t CarMotionRx_Checksum(const uint8_t *frame)
++{
++    uint8_t checksum = 0U;
++    uint8_t index;
++
++    for (index = 0U; index < CAR_MOTION_RX_FRAME_SIZE - 1U; index++) {
++        checksum = (uint8_t)(checksum + frame[index]);
++    }
++    return checksum;
++}
++
++static void CarMotionRx_AcceptFrame(const uint8_t *frame)
++{
++    uint8_t sequence = frame[2];
++
++    if (s_rx.has_sequence != 0U && sequence == s_rx.last_sequence) {
++        s_rx.duplicate_frame_count++;
++        return;
++    }
++
++    s_rx.has_sequence = 1U;
++    s_rx.last_sequence = sequence;
++    s_rx.sequence = sequence;
++    s_rx.flags = frame[3];
++    s_rx.planned_cps = CarMotionRx_ReadI16(&frame[4]);
++    s_rx.acceleration_mm_s2 = CarMotionRx_ReadI16(&frame[6]);
++    s_rx.last_frame_ms = (uint32_t)tick_ms;
++    s_rx.frame_generation++;
++    s_rx.valid_frame_count++;
++}
++
++static void CarMotionRx_ProcessByte(uint8_t byte)
++{
++    s_rx.rx_byte_count++;
++
++    if (s_rx.index == 0U) {
++        if (byte == CAR_MOTION_RX_HEADER_0) {
++            s_rx.buffer[0] = byte;
++            s_rx.index = 1U;
++        }
++        return;
++    }
++
++    if (s_rx.index == 1U) {
++        if (byte == CAR_MOTION_RX_HEADER_1) {
++            s_rx.buffer[1] = byte;
++            s_rx.index = 2U;
++        } else if (byte == CAR_MOTION_RX_HEADER_0) {
++            s_rx.buffer[0] = byte;
++            s_rx.index = 1U;
++        } else {
++            s_rx.index = 0U;
++        }
++        return;
++    }
++
++    s_rx.buffer[s_rx.index++] = byte;
++    if (s_rx.index < CAR_MOTION_RX_FRAME_SIZE) {
++        return;
++    }
++
++    s_rx.index = 0U;
++    if (CarMotionRx_Checksum(s_rx.buffer) !=
++        s_rx.buffer[CAR_MOTION_RX_FRAME_SIZE - 1U]) {
++        s_rx.checksum_error_count++;
++        return;
++    }
++
++    CarMotionRx_AcceptFrame(s_rx.buffer);
++}
++
++static uint32_t CarMotionRx_Drain(uint32_t limit)
++{
++    uint32_t drained = 0U;
++
++    while (!DL_UART_Main_isRXFIFOEmpty(UART_1_INST) && drained < limit) {
++        CarMotionRx_ProcessByte(DL_UART_Main_receiveData(UART_1_INST));
++        drained++;
++    }
++    return drained;
++}
++
++void CarMotionRx_Init(void)
++{
++    memset(&s_rx, 0, sizeof(s_rx));
++    s_rx.gain = CAR_MOTION_RX_DEFAULT_GAIN;
++    s_rx.angle_limit_deg = CAR_MOTION_RX_DEFAULT_LIMIT_DEG;
++    s_rx.deadband_mps2 = CAR_MOTION_RX_DEFAULT_DEADBAND_MPS2;
++    s_rx.direction_sign = CAR_MOTION_RX_DEFAULT_DIRECTION;
++    s_rx.last_process_ms = (uint32_t)tick_ms;
++
++    (void)CarMotionRx_Drain(CAR_MOTION_RX_DRAIN_LIMIT);
++    NVIC_ClearPendingIRQ(UART_1_INST_INT_IRQN);
++    NVIC_EnableIRQ(UART_1_INST_INT_IRQN);
++}
++
++void CarMotionRx_Poll(void)
++{
++    uint32_t primask = __get_PRIMASK();
++    uint32_t drained;
++
++    __disable_irq();
++    drained = CarMotionRx_Drain(CAR_MOTION_RX_DRAIN_LIMIT);
++    if (drained > 0U) {
++        s_rx.poll_drain_count++;
++    }
++    if (primask == 0U) {
++        __enable_irq();
++    }
++}
++
++uint8_t CarMotionRx_IsLinkValid(uint32_t now_ms)
++{
++    uint32_t last_frame_ms;
++    uint32_t frame_count;
++    uint32_t primask = __get_PRIMASK();
++
++    __disable_irq();
++    last_frame_ms = s_rx.last_frame_ms;
++    frame_count = s_rx.valid_frame_count;
++    if (primask == 0U) {
++        __enable_irq();
++    }
++
++    return (frame_count != 0U) &&
++        ((uint32_t)(now_ms - last_frame_ms) <=
++         CAR_MOTION_RX_LINK_TIMEOUT_MS);
++}
++
++uint8_t CarMotionRx_IsMotionActive(uint32_t now_ms)
++{
++    uint8_t flags;
++    uint32_t primask;
++
++    if (CarMotionRx_IsLinkValid(now_ms) == 0U) {
++        return 0U;
++    }
++
++    primask = __get_PRIMASK();
++    __disable_irq();
++    flags = s_rx.flags;
++    if (primask == 0U) {
++        __enable_irq();
++    }
++
++    return ((flags & CAR_MOTION_FLAG_RUNNING) != 0U) &&
++           ((flags & CAR_MOTION_FLAG_BALANCE_MODE) != 0U) &&
++           ((flags & CAR_MOTION_FLAG_EMERGENCY) == 0U);
++}
++
++void CarMotionRx_Process(uint32_t now_ms)
++{
++    int16_t acceleration_mm_s2;
++    float target_acceleration_mps2;
++    float effective_acceleration_mps2;
++    float target_angle_deg;
++    uint32_t primask;
++
++    if ((uint32_t)(now_ms - s_rx.last_process_ms) <
++        CAR_MOTION_RX_PROCESS_PERIOD_MS) {
++        return;
++    }
++    s_rx.last_process_ms = now_ms;
++
++    primask = __get_PRIMASK();
++    __disable_irq();
++    acceleration_mm_s2 = s_rx.acceleration_mm_s2;
++    if (primask == 0U) {
++        __enable_irq();
++    }
++
++    target_acceleration_mps2 =
++        (CarMotionRx_IsMotionActive(now_ms) != 0U) ?
++            ((float)acceleration_mm_s2 * 0.001f) : 0.0f;
++
++    if (CarMotionRx_IsLinkValid(now_ms) != 0U) {
++        s_rx.filtered_acceleration_mps2 +=
++            CAR_MOTION_RX_FILTER_ALPHA *
++            (target_acceleration_mps2 -
++             s_rx.filtered_acceleration_mps2);
++    } else {
++        s_rx.filtered_acceleration_mps2 +=
++            CAR_MOTION_RX_DECAY_ALPHA *
++            (0.0f - s_rx.filtered_acceleration_mps2);
++    }
++
++    effective_acceleration_mps2 = s_rx.filtered_acceleration_mps2;
++    if (CarMotionRx_Abs(effective_acceleration_mps2) <
++        s_rx.deadband_mps2) {
++        effective_acceleration_mps2 = 0.0f;
++    } else if (effective_acceleration_mps2 > 0.0f) {
++        effective_acceleration_mps2 -= s_rx.deadband_mps2;
++    } else {
++        effective_acceleration_mps2 += s_rx.deadband_mps2;
++    }
++
++    target_angle_deg =
++        (float)s_rx.direction_sign *
++        s_rx.gain *
++        atanf(effective_acceleration_mps2 /
++              CAR_MOTION_RX_GRAVITY_MPS2) *
++        CAR_MOTION_RX_RAD_TO_DEG;
++
++    s_rx.feedforward_angle_deg = CarMotionRx_Limit(
++        target_angle_deg,
++        -s_rx.angle_limit_deg,
++        s_rx.angle_limit_deg);
++}
++
++void CarMotionRx_SetGain(float gain)
++{
++    if (gain == gain) {
++        s_rx.gain = CarMotionRx_Limit(gain, 0.0f, 2.0f);
++    }
++}
++
++void CarMotionRx_SetAngleLimit(float angle_limit_deg)
++{
++    if (angle_limit_deg == angle_limit_deg) {
++        s_rx.angle_limit_deg = CarMotionRx_Limit(
++            CarMotionRx_Abs(angle_limit_deg), 0.0f, 3.0f);
++    }
++}
++
++void CarMotionRx_SetDeadband(float deadband_mps2)
++{
++    if (deadband_mps2 == deadband_mps2) {
++        s_rx.deadband_mps2 = CarMotionRx_Limit(
++            CarMotionRx_Abs(deadband_mps2), 0.0f, 1.0f);
++    }
++}
++
++void CarMotionRx_SetDirection(int8_t sign)
++{
++    s_rx.direction_sign = (sign < 0) ? -1 : 1;
++}
++
++float CarMotionRx_GetFeedforwardAngleDeg(void)
++{
++    return s_rx.feedforward_angle_deg;
++}
++
++float CarMotionRx_GetAccelerationMps2(void)
++{
++    return s_rx.filtered_acceleration_mps2;
++}
++
++void CarMotionRx_GetSnapshot(CarMotionRxSnapshot_t *snapshot)
++{
++    uint32_t now_ms;
++    uint32_t primask;
++
++    if (snapshot == 0) {
++        return;
++    }
++
++    now_ms = (uint32_t)tick_ms;
++    primask = __get_PRIMASK();
++    __disable_irq();
++    snapshot->sequence = s_rx.sequence;
++    snapshot->flags = s_rx.flags;
++    snapshot->planned_cps = s_rx.planned_cps;
++    snapshot->acceleration_mm_s2 = s_rx.acceleration_mm_s2;
++    snapshot->last_frame_ms = s_rx.last_frame_ms;
++    snapshot->valid_frame_count = s_rx.valid_frame_count;
++    snapshot->checksum_error_count = s_rx.checksum_error_count;
++    snapshot->duplicate_frame_count = s_rx.duplicate_frame_count;
++    snapshot->rx_byte_count = s_rx.rx_byte_count;
++    snapshot->irq_count = s_rx.irq_count;
++    snapshot->poll_drain_count = s_rx.poll_drain_count;
++    if (primask == 0U) {
++        __enable_irq();
++    }
++
++    snapshot->filtered_acceleration_mps2 =
++        s_rx.filtered_acceleration_mps2;
++    snapshot->feedforward_angle_deg = s_rx.feedforward_angle_deg;
++    snapshot->frame_age_ms =
++        (snapshot->valid_frame_count == 0U) ? 0xFFFFFFFFU :
++        (uint32_t)(now_ms - snapshot->last_frame_ms);
++    snapshot->link_valid = CarMotionRx_IsLinkValid(now_ms);
++    snapshot->motion_active = CarMotionRx_IsMotionActive(now_ms);
++}
++
++void CarMotionRx_ResetDiagnostics(void)
++{
++    uint32_t primask = __get_PRIMASK();
++
++    __disable_irq();
++    s_rx.index = 0U;
++    s_rx.has_sequence = 0U;
++    s_rx.frame_generation = 0U;
++    s_rx.valid_frame_count = 0U;
++    s_rx.checksum_error_count = 0U;
++    s_rx.duplicate_frame_count = 0U;
++    s_rx.rx_byte_count = 0U;
++    s_rx.irq_count = 0U;
++    s_rx.poll_drain_count = 0U;
++    if (primask == 0U) {
++        __enable_irq();
++    }
++}
++
++void UART_1_INST_IRQHandler(void)
++{
++    s_rx.irq_count++;
++    (void)DL_UART_Main_getPendingInterrupt(UART_1_INST);
++    (void)CarMotionRx_Drain(CAR_MOTION_RX_DRAIN_LIMIT);
++}
+diff -ruN '--exclude=Debug' balance/pinghengqiu/CarMotionRx.h pinghengqiu_req4/CarMotionRx.h
+--- balance/pinghengqiu/CarMotionRx.h	1970-01-01 00:00:00.000000000 +0000
++++ pinghengqiu_req4/CarMotionRx.h	2026-08-01 03:43:56.658709876 +0000
+@@ -0,0 +1,53 @@
++#ifndef CAR_MOTION_RX_H_
++#define CAR_MOTION_RX_H_
++
++#include <stdint.h>
++
++#define CAR_MOTION_RX_FRAME_SIZE          (9U)
++#define CAR_MOTION_RX_HEADER_0             (0xA5U)
++#define CAR_MOTION_RX_HEADER_1             (0x5AU)
++
++#define CAR_MOTION_FLAG_RUNNING            (1U << 0)
++#define CAR_MOTION_FLAG_EMERGENCY          (1U << 1)
++#define CAR_MOTION_FLAG_READY              (1U << 2)
++#define CAR_MOTION_FLAG_BALANCE_MODE       (1U << 3)
++
++typedef struct {
++    uint8_t sequence;
++    uint8_t flags;
++    int16_t planned_cps;
++    int16_t acceleration_mm_s2;
++
++    float filtered_acceleration_mps2;
++    float feedforward_angle_deg;
++
++    uint32_t last_frame_ms;
++    uint32_t frame_age_ms;
++    uint32_t valid_frame_count;
++    uint32_t checksum_error_count;
++    uint32_t duplicate_frame_count;
++    uint32_t rx_byte_count;
++    uint32_t irq_count;
++    uint32_t poll_drain_count;
++
++    uint8_t link_valid;
++    uint8_t motion_active;
++} CarMotionRxSnapshot_t;
++
++void CarMotionRx_Init(void);
++void CarMotionRx_Poll(void);
++void CarMotionRx_Process(uint32_t now_ms);
++
++void CarMotionRx_SetGain(float gain);
++void CarMotionRx_SetAngleLimit(float angle_limit_deg);
++void CarMotionRx_SetDeadband(float deadband_mps2);
++void CarMotionRx_SetDirection(int8_t sign);
++
++float CarMotionRx_GetFeedforwardAngleDeg(void);
++float CarMotionRx_GetAccelerationMps2(void);
++uint8_t CarMotionRx_IsLinkValid(uint32_t now_ms);
++uint8_t CarMotionRx_IsMotionActive(uint32_t now_ms);
++void CarMotionRx_GetSnapshot(CarMotionRxSnapshot_t *snapshot);
++void CarMotionRx_ResetDiagnostics(void);
++
++#endif /* CAR_MOTION_RX_H_ */
+diff -ruN '--exclude=Debug' balance/pinghengqiu/H2026_REQ4_VISUAL_ACCEL_FEEDFORWARD_README.md pinghengqiu_req4/H2026_REQ4_VISUAL_ACCEL_FEEDFORWARD_README.md
+--- balance/pinghengqiu/H2026_REQ4_VISUAL_ACCEL_FEEDFORWARD_README.md	1970-01-01 00:00:00.000000000 +0000
++++ pinghengqiu_req4/H2026_REQ4_VISUAL_ACCEL_FEEDFORWARD_README.md	2026-08-01 03:51:31.582693938 +0000
+@@ -0,0 +1,90 @@
++# H2026 è¦æ±‚4ï¼šè§†è§‰åé¦ˆ + å°è½¦åŠ é€Ÿåº¦å‰é¦ˆ
++
++## åŸåˆ™
++
++è¦æ±‚3å·²ç»å®Œæˆå®æœºè°ƒè¯•ï¼Œæœ¬ç‰ˆä¸ä¿®æ”¹è¦æ±‚3çš„ç›®æ ‡ã€é˜¶æ®µæ—¶é—´ã€è¿åŠ¨æ›²çº¿ã€é¢„æµ‹åˆ¶åŠ¨ã€PIDã€æœ€å¤§å€¾è§’æˆ–ç”µæœºé¢‘ç‡ã€‚
++
++è¦æ±‚4å•ç‹¬ä½¿ç”¨ï¼š
++
++```text
++æœ€ç»ˆæ‘†æ†è§’ = è§†è§‰åé¦ˆæ‘†æ†è§’ + å°è½¦åŠ é€Ÿåº¦å‰é¦ˆè§’
++```
++
++æœ€ç»ˆç»“æœä»å—åŸ `max_flap_angle_deg` é™åˆ¶ã€‚
++
++## æ¿é—´è¿æ¥
++
++```text
++å°è½¦æ¿ PB6 / UART1_TX  â”€â”€â”€â”€â”€>  æœ¬æ¿ PB7 / UART1_RX
++å°è½¦æ¿ GND             â”€â”€â”€â”€â”€>  æœ¬æ¿ GND
++```
++
++æœ¬æ¿PB6é…ç½®ä¸ºUART1_TXé¢„ç•™ï¼Œä¸éœ€è¦è¿æ¥ã€‚
++
++## å¯åŠ¨è¦æ±‚4
++
++1. å…ˆæŒ‰åŸæ–¹æ³•å®Œæˆæœºæ¢°è°ƒå¹³ä¸è½¯ä»¶é›¶ç‚¹è®¾ç½®ã€‚
++2. ç¡®è®¤MaixCAM2æŒç»­å‘é€æœ‰æ•ˆçƒå¿ƒä½ç½®ã€‚
++3. æŒ‰PB4ï¼Œæˆ–åœ¨UART0å‘é€ `req4`ã€‚
++4. ç­‰é’¢çƒç¨³å®šåœ¨Oç‚¹åï¼ŒæŒ‰å°è½¦æ¿PB11æˆ–PB10å¯åŠ¨è¿ç»­å¾ªè¿¹ã€‚
++
++PB4å¯¹åº” `KEY_2`ï¼Œä½ç”µå¹³æœ‰æ•ˆï¼ŒæŒ‰é’®å¦ä¸€ç«¯æ¥GNDã€‚
++
++## é»˜è®¤å‰é¦ˆå‚æ•°
++
++```text
++carffgain  = 0.85
++carfflimit = 1.20 deg
++carffdead  = 0.015 m/sÂ²
++carffdir   = -1
++UART timeout = 120 ms
++```
++
++å½“å‰å°è½¦220mm/sÂ²è§„åˆ’åŠ é€Ÿåº¦ç»æ•´æ•°CPSæ¢ç®—åçº¦0.214m/sÂ²ï¼Œé»˜è®¤å‰é¦ˆçº¦-0.99Â°ã€‚
++
++## ä¸²å£å‘½ä»¤
++
++```text
++req4 / centerff      å¯åŠ¨ä¸­å¿ƒä¿æŒï¼Œå¹¶å¼€å¯æ¿é—´åŠ é€Ÿåº¦å‰é¦ˆ
++carlink              æŸ¥çœ‹æ¿é—´ä¸²å£ã€é€Ÿåº¦ã€åŠ é€Ÿåº¦å’Œå‰é¦ˆè§’
++carreset             æ¸…é™¤æ¿é—´ä¸²å£è¯Šæ–­è®¡æ•°
++carff=0 / carff=1    æ‰‹åŠ¨å…³é—­/å¼€å¯å¤–éƒ¨å‰é¦ˆ
++carffgain=0.85       è®¾ç½®å‰é¦ˆå¢ç›Š
++carfflimit=1.20      è®¾ç½®å‰é¦ˆè§’é™å¹…
++carffdead=0.015      è®¾ç½®åŠ é€Ÿåº¦æ­»åŒºï¼Œm/sÂ²
++carffdir=-1          è®¾ç½®å‰é¦ˆæ–¹å‘
++plot=4               è¾“å‡ºè¦æ±‚4ä¸“ç”¨æ³¢å½¢
++```
++
++`plot=4`è¾“å‡ºé¡ºåºï¼š
++
++```text
++target_ball_cm,
++current_ball_cm,
++error_cm,
++ball_velocity_cm_s,
++visual_flap_deg,
++car_acceleration_mps2,
++feedforward_deg,
++final_flap_deg,
++motor_target_deg,
++motor_current_deg,
++feedforward_valid,
++state,
++fault
++```
++
++## è¦æ±‚3éš”ç¦»ä¿æŠ¤
++
++- `test3`å¯åŠ¨æ—¶æ˜¾å¼å…³é—­å¤–éƒ¨åŠ é€Ÿåº¦å‰é¦ˆã€‚
++- è¦æ±‚3ä¸“ç”¨é˜¶æ®µçŠ¶æ€ä¸ä¸ºNONEæ—¶ï¼Œæ§åˆ¶å†…æ ¸å†æ¬¡å¼ºåˆ¶å±è”½å¤–éƒ¨å‰é¦ˆã€‚
++- è¦æ±‚3æ‰€æœ‰åŸå‚æ•°å®ä¿æŒä¸å˜ã€‚
++
++## å‰é¦ˆæ–¹å‘æ£€æŸ¥
++
++é¦–æ¬¡æµ‹è¯•å°†é’¢çƒæ”¾åœ¨Oç‚¹ï¼Œåªå¯åŠ¨è¦æ±‚4å’Œå¹³æ»‘èµ·æ­¥ï¼š
++
++- è‹¥å°è½¦å‘å‰åŠ é€Ÿæ—¶çƒçš„åç§»æ˜æ˜¾å‡å°ï¼Œæ–¹å‘æ­£ç¡®ã€‚
++- è‹¥åç§»å˜å¤§ï¼Œç«‹å³åœè½¦å¹¶å‘é€ `carffdir=1` åé‡è¯•ã€‚
++
++ä¸è¦åŒæ—¶ä¿®æ”¹æ»šçƒKp/Kdä¸å‰é¦ˆå¢ç›Šã€‚å…ˆåªè°ƒ `carffgain`ï¼š0.30ã€0.50ã€0.70ã€0.85ã€‚
+diff -ruN '--exclude=Debug' balance/pinghengqiu/VofaTuning.c pinghengqiu_req4/VofaTuning.c
+--- balance/pinghengqiu/VofaTuning.c	2026-08-01 03:01:17.000000000 +0000
++++ pinghengqiu_req4/VofaTuning.c	2026-08-01 03:48:13.910700863 +0000
+@@ -5,6 +5,8 @@
+ #include <string.h>
+ 
+ #include "CameraUart.h"
++#include "CarMotionRx.h"
++#include "Key.h"
+ #include "Serial.h"
+ #include "ball_balance_control.h"
+ #include "ball_link.h"
+@@ -23,7 +25,8 @@
+     VOFA_PLOT_OFF = 0,
+     VOFA_PLOT_BALANCE = 1,
+     VOFA_PLOT_IMU = 2,
+-    VOFA_PLOT_MOTOR = 3
++    VOFA_PLOT_MOTOR = 3,
++    VOFA_PLOT_REQ4 = 4
+ } VofaPlotMode_t;
+ 
+ typedef enum {
+@@ -101,6 +104,8 @@
+ static void Vofa_ProcessMotorTest(uint32_t now_ms);
+ static void Vofa_CancelLevelMove(void);
+ static void Vofa_ProcessLevelMove(uint32_t now_ms);
++static void Vofa_StartRequirement4(uint32_t now_ms);
++static void Vofa_PrintCarLink(void);
+ 
+ static char Vofa_ToLower(char value)
+ {
+@@ -260,7 +265,7 @@
+         "\r\n========== BALANCE BOARD VOFA+ ==========\r\n"
+         "Use UART0 PB0(TX)/PB1(RX), 115200 8N1.\r\n"
+         "Every command ends with CR/LF or LF.\r\n"
+-        "help | ping | serial | status | config | camera | camping | motor | imu\r\n"
++        "help | ping | serial | status | config | camera | camping | motor | imu | carlink\r\n"
+         "mangle              print relative/raw motor angle and saved level\r\n"
+         "level               current actuator position = level zero\r\n"
+         "levelsave           save current raw angle and set it as level zero\r\n"
+@@ -272,8 +277,10 @@
+         "sample=0             inject a manual ball position for bench test\r\n"
+         "kp=0.18 | ki=0 | kd=0.10\r\n"
+         "sign=1/-1 | arm=235 | maxangle=1.50 | travel=7\r\n"
+-        "timeout=1000 | clear | stop | test3\r\n"
+-        "test3: automatic O -> +5 -> -5 scoring sequence\r\n"
++        "timeout=1000 | clear | stop | test3 | req4\r\n"
++        "test3: automatic O -> +5 -> -5; car feed-forward forced OFF\r\n"
++        "req4/centerff: hold ball center with car acceleration feed-forward\r\n"
++        "PB4: start req4 center hold; PB8: existing stop/level behavior unchanged\r\n"
+         "mzero | mstop | mclear | mdir\r\n"
+         "mtarget=90           manual motor target, limited to +/-900 deg\r\n"
+         "mtest                motor travel test: -900 deg to +900 deg\r\n"
+@@ -281,8 +288,11 @@
+         "plot=1               balance CSV waveform\r\n"
+         "plot=2               MPU6050 CSV waveform\r\n"
+         "plot=3               motor target/current/error CSV waveform\r\n"
++        "plot=4               req4: target,ball,error,speed,visual,accel,ff,total...\r\n"
+         "period=50            waveform period 20..1000 ms\r\n"
+         "imucal | imugain=0.2 | imulimit=3 | imudead=0.1 | imudir=1/-1\r\n"
++        "carff=0/1 | carffgain=0.85 | carfflimit=1.20 | carffdead=0.015\r\n"
++        "carffdir=1/-1 | carreset\r\n"
+         "camping              send $PING* to MaixCAM2 on UART2\r\n"
+         "camreset             reset camera UART/parser diagnostics\r\n"
+         "Old forms such as [target,5] are also accepted.\r\n"
+@@ -307,7 +317,8 @@
+     Serial_Printf(
+         "STATUS state=%s fault=%s enable=%u level=%u settled=%u "
+         "target=%.3f ball=%.3f error=%.3f speed=%.3f "
+-        "flap=%.3f lift=%.3f motor_target=%.3f motor=%.3f\r\n",
++        "visual=%.3f car_a=%.3f ff=%.3f flap=%.3f "
++        "ff_en=%u ff_ok=%u lift=%.3f motor_target=%.3f motor=%.3f\r\n",
+         Vofa_BalanceStateName(snapshot.state),
+         Vofa_FaultName(snapshot.fault),
+         (unsigned)snapshot.enabled,
+@@ -317,7 +328,12 @@
+         (double)snapshot.current_ball_cm,
+         (double)snapshot.ball_error_cm,
+         (double)snapshot.ball_velocity_cm_s,
++        (double)snapshot.visual_flap_target_deg,
++        (double)snapshot.feedforward_acceleration_mps2,
++        (double)snapshot.feedforward_angle_deg,
+         (double)snapshot.flap_target_deg,
++        (unsigned)snapshot.feedforward_enabled,
++        (unsigned)snapshot.feedforward_valid,
+         (double)snapshot.actuator_target_mm,
+         (double)snapshot.motor_target_deg,
+         (double)snapshot.motor_current_deg);
+@@ -459,6 +475,33 @@
+         (double)snapshot.feedforward_angle_deg);
+ }
+ 
++static void Vofa_PrintCarLink(void)
++{
++    CarMotionRxSnapshot_t link;
++
++    CarMotionRx_GetSnapshot(&link);
++    Serial_Printf(
++        "CAR_LINK UART1 PB7_RX/PB6_TX 115200 valid=%u active=%u "
++        "seq=%u flags=0x%02X cps=%d accel=%dmm/s2 filtered=%.4fm/s2 "
++        "ff=%.4fdeg age=%lu frames=%lu checksum=%lu duplicate=%lu "
++        "bytes=%lu irq=%lu poll=%lu\r\n",
++        (unsigned)link.link_valid,
++        (unsigned)link.motion_active,
++        (unsigned)link.sequence,
++        (unsigned)link.flags,
++        (int)link.planned_cps,
++        (int)link.acceleration_mm_s2,
++        (double)link.filtered_acceleration_mps2,
++        (double)link.feedforward_angle_deg,
++        (unsigned long)link.frame_age_ms,
++        (unsigned long)link.valid_frame_count,
++        (unsigned long)link.checksum_error_count,
++        (unsigned long)link.duplicate_frame_count,
++        (unsigned long)link.rx_byte_count,
++        (unsigned long)link.irq_count,
++        (unsigned long)link.poll_drain_count);
++}
++
+ static void Vofa_PrintPlot(void)
+ {
+     if (s_plot_mode == VOFA_PLOT_BALANCE) {
+@@ -505,6 +548,25 @@
+                      snapshot.current_angle_deg),
+             (unsigned)snapshot.reached,
+             (unsigned)snapshot.fault);
++    } else if (s_plot_mode == VOFA_PLOT_REQ4) {
++        BallBalanceSnapshot_t snapshot;
++        BallBalance_GetSnapshot(&snapshot);
++
++        Serial_Printf(
++            "%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%u,%u\n",
++            (double)snapshot.target_ball_cm,
++            (double)snapshot.current_ball_cm,
++            (double)snapshot.ball_error_cm,
++            (double)snapshot.ball_velocity_cm_s,
++            (double)snapshot.visual_flap_target_deg,
++            (double)snapshot.feedforward_acceleration_mps2,
++            (double)snapshot.feedforward_angle_deg,
++            (double)snapshot.flap_target_deg,
++            (double)snapshot.motor_target_deg,
++            (double)snapshot.motor_current_deg,
++            (unsigned)snapshot.feedforward_valid,
++            (unsigned)snapshot.state,
++            (unsigned)snapshot.fault);
+     }
+ }
+ 
+@@ -540,6 +602,36 @@
+         (positive_reached != 0U) ? "POS_PASS" : "POS_TIMEOUT");
+ }
+ 
++static void Vofa_StartRequirement4(uint32_t now_ms)
++{
++    (void)now_ms;
++
++    if (BallBalance_IsReady() == 0U) {
++        Serial_SendString(
++            "ERR req4 requires level zero and a valid camera ball position\r\n");
++        return;
++    }
++
++    s_test_state = TEST3_IDLE;
++    Vofa_CancelMotorTest();
++    Vofa_CancelLevelMove();
++    BallBalance_ClearFault();
++
++    if (BallBalance_SetTargetCm(0.0f) == 0U ||
++        BallBalance_Enable(1U) == 0U) {
++        Serial_SendString("ERR cannot start req4 center controller\r\n");
++        return;
++    }
++
++    /* Enable after BallBalance_Enable(), because Enable resets controller state. */
++    BallBalance_SetExternalFeedforwardEnabled(1U);
++    s_plot_mode = VOFA_PLOT_REQ4;
++    s_plot_period_ms = 50U;
++
++    Serial_SendString(
++        "REQ4 start: target center=0 cm, camera feedback + car UART1 acceleration feed-forward; PB4/req4\r\n");
++}
++
+ static void Vofa_StartTest3(uint32_t now_ms)
+ {
+     BallBalanceConfig_t config;
+@@ -561,6 +653,8 @@
+ 
+     Vofa_CancelMotorTest();
+     Vofa_CancelLevelMove();
++    /* Requirement 3 is intentionally kept visual-only. */
++    BallBalance_SetExternalFeedforwardEnabled(0U);
+     BallBalance_ClearFault();
+     if (BallBalance_SetTargetCm(TEST3_POSITIVE_TARGET_CM) == 0U ||
+         BallBalance_Enable(1U) == 0U) {
+@@ -979,6 +1073,14 @@
+         Vofa_StartLevelMove(now_ms);
+     } else if (strcmp(command, "imu") == 0) {
+         Vofa_PrintImu();
++    } else if (strcmp(command, "carlink") == 0) {
++        Vofa_PrintCarLink();
++    } else if (strcmp(command, "req4") == 0 ||
++               strcmp(command, "centerff") == 0) {
++        Vofa_StartRequirement4(now_ms);
++    } else if (strcmp(command, "carreset") == 0) {
++        CarMotionRx_ResetDiagnostics();
++        Serial_SendString("OK car motion UART diagnostics reset\r\n");
+     } else if (strcmp(command, "level") == 0 ||
+                strcmp(command, "mzero") == 0) {
+         s_test_state = TEST3_IDLE;
+@@ -1104,8 +1206,8 @@
+             }
+         }
+     } else if (Vofa_ParseAssignment(command, "plot", &value_text) != 0U) {
+-        if (Vofa_ParseU32(value_text, &u32_value) == 0U || u32_value > 3U) {
+-            Serial_SendString("ERR plot must be 0, 1, 2 or 3\r\n");
++        if (Vofa_ParseU32(value_text, &u32_value) == 0U || u32_value > 4U) {
++            Serial_SendString("ERR plot must be 0, 1, 2, 3 or 4\r\n");
+         } else {
+             s_plot_mode = (VofaPlotMode_t)u32_value;
+             Serial_Printf("OK plot=%lu\r\n", (unsigned long)u32_value);
+@@ -1119,6 +1221,42 @@
+             s_plot_period_ms = u32_value;
+             Serial_Printf("OK period=%lu ms\r\n", (unsigned long)u32_value);
+         }
++    } else if (Vofa_ParseAssignment(command, "carff", &value_text) != 0U) {
++        if (Vofa_ParseU32(value_text, &u32_value) == 0U || u32_value > 1U) {
++            Serial_SendString("ERR carff must be 0 or 1\r\n");
++        } else {
++            BallBalance_SetExternalFeedforwardEnabled((uint8_t)u32_value);
++            Serial_Printf("OK carff=%lu\r\n", (unsigned long)u32_value);
++        }
++    } else if (Vofa_ParseAssignment(command, "carffgain", &value_text) != 0U) {
++        if (Vofa_ParseFloat(value_text, &float_value) == 0U) {
++            Serial_SendString("ERR invalid carffgain\r\n");
++        } else {
++            CarMotionRx_SetGain(float_value);
++            Serial_Printf("OK carffgain=%.3f\r\n", (double)float_value);
++        }
++    } else if (Vofa_ParseAssignment(command, "carfflimit", &value_text) != 0U) {
++        if (Vofa_ParseFloat(value_text, &float_value) == 0U) {
++            Serial_SendString("ERR invalid carfflimit\r\n");
++        } else {
++            CarMotionRx_SetAngleLimit(float_value);
++            Serial_Printf("OK carfflimit=%.3f deg\r\n", (double)float_value);
++        }
++    } else if (Vofa_ParseAssignment(command, "carffdead", &value_text) != 0U) {
++        if (Vofa_ParseFloat(value_text, &float_value) == 0U) {
++            Serial_SendString("ERR invalid carffdead\r\n");
++        } else {
++            CarMotionRx_SetDeadband(float_value);
++            Serial_Printf("OK carffdead=%.4f m/s2\r\n", (double)float_value);
++        }
++    } else if (Vofa_ParseAssignment(command, "carffdir", &value_text) != 0U) {
++        if (Vofa_ParseFloat(value_text, &float_value) == 0U ||
++            (float_value != 1.0f && float_value != -1.0f)) {
++            Serial_SendString("ERR carffdir must be 1 or -1\r\n");
++        } else {
++            CarMotionRx_SetDirection((float_value < 0.0f) ? -1 : 1);
++            Serial_Printf("OK carffdir=%d\r\n", (float_value < 0.0f) ? -1 : 1);
++        }
+     } else if (Vofa_ParseAssignment(command, "imugain", &value_text) != 0U) {
+         if (Vofa_ParseFloat(value_text, &float_value) == 0U) {
+             Serial_SendString("ERR invalid imugain\r\n");
+@@ -1198,6 +1336,7 @@
+         "\r\n========================================\r\n"
+         " H2026 balance board - clean VOFA build\r\n"
+         " UART0 PB0/PB1 115200; camera UART2 PB15/PB16\r\n"
++        " car motion UART1 PB7(RX)/PB6(TX) 115200; PB4=req4\r\n"
+         " MPU6050 I2C1 PA16/PA29 retained\r\n"
+         " Send help followed by Enter\r\n"
+         "========================================\r\n");
+@@ -1238,6 +1377,11 @@
+         }
+     }
+ 
++
++    if (Key_Check(KEY_2, KEY_DOWN) != 0U) {
++        Vofa_StartRequirement4(now_ms);
++    }
++
+     Vofa_ProcessTest3(now_ms);
+     Vofa_ProcessMotorTest(now_ms);
+     Vofa_ProcessLevelMove(now_ms);
+diff -ruN '--exclude=Debug' balance/pinghengqiu/ball_balance_control.c pinghengqiu_req4/ball_balance_control.c
+--- balance/pinghengqiu/ball_balance_control.c	2026-08-01 03:01:17.000000000 +0000
++++ pinghengqiu_req4/ball_balance_control.c	2026-08-01 03:45:57.010705659 +0000
+@@ -189,6 +189,11 @@
+     volatile uint8_t enabled;
+     volatile uint8_t level_calibrated;
+ 
++    volatile float external_feedforward_angle_deg;
++    volatile float external_feedforward_acceleration_mps2;
++    volatile uint8_t external_feedforward_enabled;
++    volatile uint8_t external_feedforward_valid;
++
+     volatile float measured_ball_cm;
+     volatile uint32_t measurement_timestamp_ms;
+     volatile uint32_t measurement_sequence;
+@@ -1066,6 +1071,10 @@
+ 
+     s_balance.target_ball_cm = 0.0f;
+     s_balance.enabled = 0U;
++    s_balance.external_feedforward_angle_deg = 0.0f;
++    s_balance.external_feedforward_acceleration_mps2 = 0.0f;
++    s_balance.external_feedforward_enabled = 0U;
++    s_balance.external_feedforward_valid = 0U;
+ 
+     /*
+      * Do not redefine the current power-up position as horizontal. The user
+@@ -1090,6 +1099,9 @@
+     s_balance.snapshot.p_output_deg = 0.0f;
+     s_balance.snapshot.i_output_deg = 0.0f;
+     s_balance.snapshot.d_output_deg = 0.0f;
++    s_balance.snapshot.visual_flap_target_deg = 0.0f;
++    s_balance.snapshot.feedforward_angle_deg = 0.0f;
++    s_balance.snapshot.feedforward_acceleration_mps2 = 0.0f;
+     s_balance.snapshot.flap_target_deg = 0.0f;
+     s_balance.snapshot.actuator_target_mm = 0.0f;
+     s_balance.snapshot.actuator_current_mm = 0.0f;
+@@ -1100,6 +1112,8 @@
+     s_balance.snapshot.level_calibrated = 0U;
+     s_balance.snapshot.enabled = 0U;
+     s_balance.snapshot.settled = 0U;
++    s_balance.snapshot.feedforward_enabled = 0U;
++    s_balance.snapshot.feedforward_valid = 0U;
+     s_balance.snapshot.state =
+         BALL_BALANCE_STATE_NOT_READY;
+     s_balance.snapshot.fault =
+@@ -1204,6 +1218,9 @@
+     float integral_candidate;
+ 
+     float controller_output;
++    float visual_flap_target_deg;
++    float feedforward_angle_deg;
++    float feedforward_acceleration_mps2;
+     float flap_target_deg;
+     float actuator_target_mm;
+     float actuator_current_mm;
+@@ -1221,10 +1238,31 @@
+     uint8_t stopping_brake_active;
+     uint8_t r3_motion_override;
+     uint8_t positive_preposition_override;
++    uint8_t feedforward_active;
+ 
+     config = s_balance.config;
+     now_ms = (uint32_t)tick_ms;
+ 
++    {
++        uint32_t primask = __get_PRIMASK();
++        __disable_irq();
++        feedforward_angle_deg =
++            s_balance.external_feedforward_angle_deg;
++        feedforward_acceleration_mps2 =
++            s_balance.external_feedforward_acceleration_mps2;
++        feedforward_active =
++            (s_balance.external_feedforward_enabled != 0U &&
++             s_balance.external_feedforward_valid != 0U) ? 1U : 0U;
++        if (primask == 0U) {
++            __enable_irq();
++        }
++    }
++
++    /* Requirement 3 always keeps the original visual-only controller. */
++    if (s_balance.r3_phase != BALL_BALANCE_R3_PHASE_NONE) {
++        feedforward_active = 0U;
++    }
++
+     cl_fault = CL_GetFault(MOTOR_AXIS_X);
+     motor_fault = BallBalance_MapMotorFault(cl_fault);
+ 
+@@ -1604,26 +1642,39 @@
+         }
+     }
+ 
+-    flap_target_deg =
++    visual_flap_target_deg =
+         (float)config.control_sign *
+         controller_output;
+ 
+     /*
+-     * Remove very small commands near the target to avoid a camera-noise
+-     * limit cycle. Breakaway is already disabled inside this region.
++     * Remove very small visual-feedback commands near the target to avoid a
++     * camera-noise limit cycle. Requirement-4 acceleration feed-forward is
++     * added afterwards, so it remains available even when visual error is zero.
+      */
+     if (BallBalance_Abs(error_cm) <=
+             BALL_BALANCE_TARGET_DEADBAND_CM &&
+         BallBalance_Abs(velocity_cm_s) <=
+             BALL_BALANCE_BREAKAWAY_STILL_SPEED_CM_S) {
+-        flap_target_deg = 0.0f;
++        visual_flap_target_deg = 0.0f;
+     }
+ 
+-    flap_target_deg = BallBalance_Limit(
+-        flap_target_deg,
++    visual_flap_target_deg = BallBalance_Limit(
++        visual_flap_target_deg,
+         -flap_limit_deg,
+         flap_limit_deg);
+ 
++    flap_target_deg = visual_flap_target_deg;
++    if (feedforward_active != 0U) {
++        flap_target_deg += feedforward_angle_deg;
++        flap_target_deg = BallBalance_Limit(
++            flap_target_deg,
++            -config.max_flap_angle_deg,
++            config.max_flap_angle_deg);
++    } else {
++        feedforward_angle_deg = 0.0f;
++        feedforward_acceleration_mps2 = 0.0f;
++    }
++
+     /*
+      * ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î´ï¿½ï¿½ï¿½Í£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú°ï¿½ï¿½ï¿½ï¿½Ë³ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½Ö¡ï¿½
+      */
+@@ -1636,9 +1687,9 @@
+             (float)config.control_sign *
+             controller_output) <=
+             flap_limit_deg ||
+-        (flap_target_deg >= flap_limit_deg &&
++        (visual_flap_target_deg >= flap_limit_deg &&
+          (float)config.control_sign * error_cm < 0.0f) ||
+-        (flap_target_deg <= -flap_limit_deg &&
++        (visual_flap_target_deg <= -flap_limit_deg &&
+          (float)config.control_sign * error_cm > 0.0f)) {
+         s_balance.integral_error_cm_s =
+             integral_candidate;
+@@ -1696,6 +1747,12 @@
+     s_balance.snapshot.p_output_deg = p_output;
+     s_balance.snapshot.i_output_deg = i_output;
+     s_balance.snapshot.d_output_deg = d_output;
++    s_balance.snapshot.visual_flap_target_deg =
++        visual_flap_target_deg;
++    s_balance.snapshot.feedforward_angle_deg =
++        feedforward_angle_deg;
++    s_balance.snapshot.feedforward_acceleration_mps2 =
++        feedforward_acceleration_mps2;
+     s_balance.snapshot.flap_target_deg =
+         flap_target_deg;
+ 
+@@ -1720,6 +1777,10 @@
+         s_balance.enabled;
+     s_balance.snapshot.settled =
+         s_balance.settled;
++    s_balance.snapshot.feedforward_enabled =
++        s_balance.external_feedforward_enabled;
++    s_balance.snapshot.feedforward_valid =
++        (feedforward_active != 0U) ? 1U : 0U;
+     s_balance.snapshot.state =
+         s_balance.state;
+     s_balance.snapshot.fault =
+@@ -1826,6 +1887,10 @@
+ {
+     s_balance.enabled = 0U;
+     s_balance.settled = 0U;
++    s_balance.external_feedforward_enabled = 0U;
++    s_balance.external_feedforward_valid = 0U;
++    s_balance.external_feedforward_angle_deg = 0.0f;
++    s_balance.external_feedforward_acceleration_mps2 = 0.0f;
+ 
+     CL_Stop(MOTOR_AXIS_X);
+     BallBalance_ResetController();
+@@ -1864,6 +1929,12 @@
+             1.0f)) * BALL_BALANCE_RAD_TO_DEG;
+     s_balance.snapshot.enabled = 0U;
+     s_balance.snapshot.settled = 0U;
++    s_balance.snapshot.feedforward_enabled = 0U;
++    s_balance.snapshot.feedforward_valid = 0U;
++    s_balance.snapshot.visual_flap_target_deg =
++        s_balance.snapshot.flap_target_deg;
++    s_balance.snapshot.feedforward_angle_deg = 0.0f;
++    s_balance.snapshot.feedforward_acceleration_mps2 = 0.0f;
+     s_balance.snapshot.state = s_balance.state;
+     s_balance.snapshot.fault = s_balance.fault;
+ }
+@@ -1885,6 +1956,54 @@
+     BallBalance_ResetController();
+ }
+ 
++void BallBalance_SetExternalFeedforwardEnabled(uint8_t enable)
++{
++    uint32_t primask = __get_PRIMASK();
++
++    __disable_irq();
++    s_balance.external_feedforward_enabled =
++        (enable != 0U) ? 1U : 0U;
++    if (enable == 0U) {
++        s_balance.external_feedforward_valid = 0U;
++        s_balance.external_feedforward_angle_deg = 0.0f;
++        s_balance.external_feedforward_acceleration_mps2 = 0.0f;
++    }
++    if (primask == 0U) {
++        __enable_irq();
++    }
++}
++
++void BallBalance_UpdateExternalFeedforward(
++    float angle_deg,
++    float acceleration_mps2,
++    uint8_t valid)
++{
++    uint32_t primask;
++
++    if (!BallBalance_IsFinite(angle_deg) ||
++        !BallBalance_IsFinite(acceleration_mps2)) {
++        valid = 0U;
++        angle_deg = 0.0f;
++        acceleration_mps2 = 0.0f;
++    }
++
++    primask = __get_PRIMASK();
++    __disable_irq();
++    s_balance.external_feedforward_angle_deg = angle_deg;
++    s_balance.external_feedforward_acceleration_mps2 =
++        acceleration_mps2;
++    s_balance.external_feedforward_valid =
++        (valid != 0U) ? 1U : 0U;
++    if (primask == 0U) {
++        __enable_irq();
++    }
++}
++
++uint8_t BallBalance_IsExternalFeedforwardEnabled(void)
++{
++    return s_balance.external_feedforward_enabled;
++}
++
+ void BallBalance_ClearFault(void)
+ {
+     BallBalance_Stop();
+@@ -2008,6 +2127,10 @@
+         s_balance.enabled;
+     snapshot->settled =
+         s_balance.settled;
++    snapshot->feedforward_enabled =
++        s_balance.external_feedforward_enabled;
++    snapshot->feedforward_valid =
++        s_balance.external_feedforward_valid;
+     snapshot->state =
+         s_balance.state;
+     snapshot->fault =
+diff -ruN '--exclude=Debug' balance/pinghengqiu/ball_balance_control.h pinghengqiu_req4/ball_balance_control.h
+--- balance/pinghengqiu/ball_balance_control.h	2026-07-31 17:34:34.000000000 +0000
++++ pinghengqiu_req4/ball_balance_control.h	2026-08-01 03:44:40.726708332 +0000
+@@ -1,164 +1,185 @@
+-#ifndef BALL_BALANCE_CONTROL_H
+-#define BALL_BALANCE_CONTROL_H
+-
+-#include <stdint.h>
+-
+-typedef enum {
+-    BALL_BALANCE_STATE_NOT_READY = 0,
+-    BALL_BALANCE_STATE_DISABLED,
+-    BALL_BALANCE_STATE_RETURNING_ZERO,
+-    BALL_BALANCE_STATE_RUNNING,
+-    BALL_BALANCE_STATE_SETTLED,
+-    BALL_BALANCE_STATE_FAULT
+-} BallBalanceState_t;
+-
+-typedef enum {
+-    BALL_BALANCE_FAULT_NONE = 0,
+-    BALL_BALANCE_FAULT_CAMERA_TIMEOUT,
+-    BALL_BALANCE_FAULT_BALL_OUT_OF_RANGE,
+-    BALL_BALANCE_FAULT_ACTUATOR_OVER_TRAVEL,
+-    BALL_BALANCE_FAULT_MOTOR_ENCODER,
+-    BALL_BALANCE_FAULT_MOTOR_DIRECTION,
+-    BALL_BALANCE_FAULT_MOTOR_DRIVER,
+-    BALL_BALANCE_FAULT_INVALID_CONFIG
+-} BallBalanceFault_t;
+-
+-typedef struct {
+-    /*
+-     * ¸ÖÇòÎ»ÖÃ PID¡£
+-     *
+-     * kp: deg/cm
+-     * ki: deg/(cm*s)
+-     * kd: deg/(cm/s)
+-     */
+-    float kp;
+-    float ki;
+-    float kd;
+-
+-    /* °Ú¸Ë¿ØÖÆ·½Ïò£¬Ö»ÔÊĞí +1 »ò -1¡£ */
+-    int8_t control_sign;
+-
+-    /* ºÏÒ³ÖĞĞÄµ½Ë¿¸Ë×÷ÓÃµãÖĞĞÄµÄ¾àÀë¡£ */
+-    float lever_arm_mm;
+-
+-    /* µç»ú½Ç¶ÈÓëË¿¸ËÎ»ÒÆ¹ØÏµ£ºµ±Ç°Îª 180 deg/mm¡£ */
+-    float motor_deg_per_mm;
+-
+-    /* ÔÊĞíÉèÖÃµÄ¸ÖÇòÄ¿±ê·¶Î§¡£ */
+-    float ball_target_min_cm;
+-    float ball_target_max_cm;
+-
+-    /* ¼ì²âµ½¸ÖÇò³¬¹ı¸Ã·¶Î§Ê±Á¢¼´Í£Ö¹¡£ */
+-    float ball_safety_min_cm;
+-    float ball_safety_max_cm;
+-
+-    /* ×î´ó°Ú¸ËÇã½Ç¡£ */
+-    float max_flap_angle_deg;
+-
+-    /* Ïà¶ÔÓÚµ÷Æ½ÁãµãµÄË¿¸Ë°²È«ĞĞ³Ì¡£ */
+-    float actuator_min_mm;
+-    float actuator_max_mm;
+-
+-    /* »ı·ÖÏî×î´óÊä³ö½Ç¶È¡£ */
+-    float integral_output_limit_deg;
+-
+-    /* ¸ÖÇòËÙ¶ÈµÍÍ¨ÂË²¨ÏµÊı£¬·¶Î§ 0~1¡£ */
+-    float velocity_filter_alpha;
+-
+-    /* ÉãÏñÍ·Êı¾İ×î´óÔÊĞí¼ä¸ô¡£ */
+-    uint32_t camera_timeout_ms;
+-
+-    /* ÎÈ¶¨ÅĞ¾İ¡£ */
+-    float settle_position_error_cm;
+-    float settle_velocity_cm_s;
+-    uint32_t settle_time_ms;
+-} BallBalanceConfig_t;
+-
+-typedef struct {
+-    float target_ball_cm;
+-    float current_ball_cm;
+-    float ball_error_cm;
+-    float ball_velocity_cm_s;
+-
+-    float p_output_deg;
+-    float i_output_deg;
+-    float d_output_deg;
+-    float flap_target_deg;
+-
+-    float actuator_target_mm;
+-    float actuator_current_mm;
+-
+-    float motor_target_deg;
+-    float motor_current_deg;
+-
+-    uint32_t measurement_sequence;
+-    uint32_t measurement_timestamp_ms;
+-
+-    uint8_t level_calibrated;
+-    uint8_t enabled;
+-    uint8_t settled;
+-
+-    BallBalanceState_t state;
+-    BallBalanceFault_t fault;
+-} BallBalanceSnapshot_t;
+-
+-/*
+- * µ÷ÓÃË³Ğò£º
+- *
+- * Motor_Init();
+- * Encoder_Init();
+- * CL_Init();
+- * BallBalance_Init();
+- */
+-void BallBalance_Init(void);
+-
+-/* ¹Ì¶¨Ã¿20msµ÷ÓÃÒ»´Î¡£ */
+-void BallBalance_Process20ms(void);
+-
+-/*
+- * ÉãÏñÍ·Ã¿µÃµ½Ò»´ÎÓĞĞ§¸ÖÇòÎ»ÖÃºóµ÷ÓÃ¡£
+- *
+- * position_cm:
+- *   ÖĞĞÄµãÎª0£¬ÓÒ²àÎªÕı£¬×ó²àÎª¸º¡£
+- *
+- * timestamp_ms:
+- *   ½¨Òé´«Èëtick_ms¡£
+- */
+-uint8_t BallBalance_PushBallPosition(
+-    float position_cm,
+-    uint32_t timestamp_ms);
+-
+-uint8_t BallBalance_Enable(uint8_t enable);
+-uint8_t BallBalance_SetTargetCm(float target_cm);
+-void BallBalance_Stop(void);
+-
+-/*
+- * ±ØĞëÏÈÈË¹¤½«°Ú¸Ëµ÷Æ½£¬ÔÙµ÷ÓÃ´Ëº¯Êı¡£
+- * ´Ëº¯Êı»á°Ñµ±Ç°µç»ú±àÂëÆ÷Î»ÖÃÉèÎªË¿¸Ë0mm¡£
+- */
+-void BallBalance_SetLevelZero(void);
+-
+-void BallBalance_ClearFault(void);
+-
+-uint8_t BallBalance_SetPid(
+-    float kp,
+-    float ki,
+-    float kd);
+-
+-void BallBalance_GetConfig(
+-    BallBalanceConfig_t *config);
+-
+-uint8_t BallBalance_SetConfig(
+-    const BallBalanceConfig_t *config);
+-
+-uint8_t BallBalance_IsReady(void);
+-uint8_t BallBalance_IsEnabled(void);
+-uint8_t BallBalance_IsSettled(void);
+-
+-BallBalanceState_t BallBalance_GetState(void);
+-BallBalanceFault_t BallBalance_GetFault(void);
+-
+-void BallBalance_GetSnapshot(
+-    BallBalanceSnapshot_t *snapshot);
+-
++#ifndef BALL_BALANCE_CONTROL_H
++#define BALL_BALANCE_CONTROL_H
++
++#include <stdint.h>
++
++typedef enum {
++    BALL_BALANCE_STATE_NOT_READY = 0,
++    BALL_BALANCE_STATE_DISABLED,
++    BALL_BALANCE_STATE_RETURNING_ZERO,
++    BALL_BALANCE_STATE_RUNNING,
++    BALL_BALANCE_STATE_SETTLED,
++    BALL_BALANCE_STATE_FAULT
++} BallBalanceState_t;
++
++typedef enum {
++    BALL_BALANCE_FAULT_NONE = 0,
++    BALL_BALANCE_FAULT_CAMERA_TIMEOUT,
++    BALL_BALANCE_FAULT_BALL_OUT_OF_RANGE,
++    BALL_BALANCE_FAULT_ACTUATOR_OVER_TRAVEL,
++    BALL_BALANCE_FAULT_MOTOR_ENCODER,
++    BALL_BALANCE_FAULT_MOTOR_DIRECTION,
++    BALL_BALANCE_FAULT_MOTOR_DRIVER,
++    BALL_BALANCE_FAULT_INVALID_CONFIG
++} BallBalanceFault_t;
++
++typedef struct {
++    /*
++     * ¸ÖÇòÎ»ÖÃ PID¡£
++     *
++     * kp: deg/cm
++     * ki: deg/(cm*s)
++     * kd: deg/(cm/s)
++     */
++    float kp;
++    float ki;
++    float kd;
++
++    /* °Ú¸Ë¿ØÖÆ·½Ïò£¬Ö»ÔÊĞí +1 »ò -1¡£ */
++    int8_t control_sign;
++
++    /* ºÏÒ³ÖĞĞÄµ½Ë¿¸Ë×÷ÓÃµãÖĞĞÄµÄ¾àÀë¡£ */
++    float lever_arm_mm;
++
++    /* µç»ú½Ç¶ÈÓëË¿¸ËÎ»ÒÆ¹ØÏµ£ºµ±Ç°Îª 180 deg/mm¡£ */
++    float motor_deg_per_mm;
++
++    /* ÔÊĞíÉèÖÃµÄ¸ÖÇòÄ¿±ê·¶Î§¡£ */
++    float ball_target_min_cm;
++    float ball_target_max_cm;
++
++    /* ¼ì²âµ½¸ÖÇò³¬¹ı¸Ã·¶Î§Ê±Á¢¼´Í£Ö¹¡£ */
++    float ball_safety_min_cm;
++    float ball_safety_max_cm;
++
++    /* ×î´ó°Ú¸ËÇã½Ç¡£ */
++    float max_flap_angle_deg;
++
++    /* Ïà¶ÔÓÚµ÷Æ½ÁãµãµÄË¿¸Ë°²È«ĞĞ³Ì¡£ */
++    float actuator_min_mm;
++    float actuator_max_mm;
++
++    /* »ı·ÖÏî×î´óÊä³ö½Ç¶È¡£ */
++    float integral_output_limit_deg;
++
++    /* ¸ÖÇòËÙ¶ÈµÍÍ¨ÂË²¨ÏµÊı£¬·¶Î§ 0~1¡£ */
++    float velocity_filter_alpha;
++
++    /* ÉãÏñÍ·Êı¾İ×î´óÔÊĞí¼ä¸ô¡£ */
++    uint32_t camera_timeout_ms;
++
++    /* ÎÈ¶¨ÅĞ¾İ¡£ */
++    float settle_position_error_cm;
++    float settle_velocity_cm_s;
++    uint32_t settle_time_ms;
++} BallBalanceConfig_t;
++
++typedef struct {
++    float target_ball_cm;
++    float current_ball_cm;
++    float ball_error_cm;
++    float ball_velocity_cm_s;
++
++    float p_output_deg;
++    float i_output_deg;
++    float d_output_deg;
++
++    /* Requirement-4 telemetry. Requirement 3 leaves feed-forward disabled. */
++    float visual_flap_target_deg;
++    float feedforward_angle_deg;
++    float feedforward_acceleration_mps2;
++    float flap_target_deg;
++
++    float actuator_target_mm;
++    float actuator_current_mm;
++
++    float motor_target_deg;
++    float motor_current_deg;
++
++    uint32_t measurement_sequence;
++    uint32_t measurement_timestamp_ms;
++
++    uint8_t level_calibrated;
++    uint8_t enabled;
++    uint8_t settled;
++    uint8_t feedforward_enabled;
++    uint8_t feedforward_valid;
++
++    BallBalanceState_t state;
++    BallBalanceFault_t fault;
++} BallBalanceSnapshot_t;
++
++/*
++ * µ÷ÓÃË³Ğò£º
++ *
++ * Motor_Init();
++ * Encoder_Init();
++ * CL_Init();
++ * BallBalance_Init();
++ */
++void BallBalance_Init(void);
++
++/* ¹Ì¶¨Ã¿20msµ÷ÓÃÒ»´Î¡£ */
++void BallBalance_Process20ms(void);
++
++/*
++ * ÉãÏñÍ·Ã¿µÃµ½Ò»´ÎÓĞĞ§¸ÖÇòÎ»ÖÃºóµ÷ÓÃ¡£
++ *
++ * position_cm:
++ *   ÖĞĞÄµãÎª0£¬ÓÒ²àÎªÕı£¬×ó²àÎª¸º¡£
++ *
++ * timestamp_ms:
++ *   ½¨Òé´«Èëtick_ms¡£
++ */
++uint8_t BallBalance_PushBallPosition(
++    float position_cm,
++    uint32_t timestamp_ms);
++
++uint8_t BallBalance_Enable(uint8_t enable);
++uint8_t BallBalance_SetTargetCm(float target_cm);
++void BallBalance_Stop(void);
++
++/*
++ * ±ØĞëÏÈÈË¹¤½«°Ú¸Ëµ÷Æ½£¬ÔÙµ÷ÓÃ´Ëº¯Êı¡£
++ * ´Ëº¯Êı»á°Ñµ±Ç°µç»ú±àÂëÆ÷Î»ÖÃÉèÎªË¿¸Ë0mm¡£
++ */
++void BallBalance_SetLevelZero(void);
++
++void BallBalance_ClearFault(void);
++
++
++/*
++ * Requirement-4 external acceleration feed-forward. The feed-forward angle is
++ * an actual flap angle and is added after the visual feedback controller.
++ * It is disabled by default and never participates in the requirement-3
++ * +5 cm -> -5 cm motion unless explicitly enabled.
++ */
++void BallBalance_SetExternalFeedforwardEnabled(uint8_t enable);
++void BallBalance_UpdateExternalFeedforward(
++    float angle_deg,
++    float acceleration_mps2,
++    uint8_t valid);
++uint8_t BallBalance_IsExternalFeedforwardEnabled(void);
++
++uint8_t BallBalance_SetPid(
++    float kp,
++    float ki,
++    float kd);
++
++void BallBalance_GetConfig(
++    BallBalanceConfig_t *config);
++
++uint8_t BallBalance_SetConfig(
++    const BallBalanceConfig_t *config);
++
++uint8_t BallBalance_IsReady(void);
++uint8_t BallBalance_IsEnabled(void);
++uint8_t BallBalance_IsSettled(void);
++
++BallBalanceState_t BallBalance_GetState(void);
++BallBalanceFault_t BallBalance_GetFault(void);
++
++void BallBalance_GetSnapshot(
++    BallBalanceSnapshot_t *snapshot);
++
+ #endif
+\ No newline at end of file
+diff -ruN '--exclude=Debug' balance/pinghengqiu/empty.c pinghengqiu_req4/empty.c
+--- balance/pinghengqiu/empty.c	2026-07-31 17:34:34.000000000 +0000
++++ pinghengqiu_req4/empty.c	2026-08-01 03:45:57.010705659 +0000
+@@ -3,6 +3,7 @@
+ #include <stdint.h>
+ 
+ #include "CameraUart.h"
++#include "CarMotionRx.h"
+ #include "Key.h"
+ #include "Serial.h"
+ #include "VofaTuning.h"
+@@ -58,6 +59,7 @@
+     BallBalance_Init();
+     BallLink_Init();
+     CameraUart_Init();
++    CarMotionRx_Init();
+ 
+     /*
+      * MPU6050 remains independent of the ball controller for now.
+@@ -82,8 +84,19 @@
+     while (1) {
+         uint32_t now_ms = (uint32_t)tick_ms;
+ 
+-        /* UART2 polling is a fallback if the camera RX interrupt is missed. */
++        /* UART polling fallbacks keep both links alive if an IRQ is missed. */
+         CameraUart_Poll();
++        CarMotionRx_Poll();
++        CarMotionRx_Process(now_ms);
++
++        /*
++         * External feed-forward data is updated continuously, but the ball
++         * controller only applies it after the req4 command/PB4 enables it.
++         */
++        BallBalance_UpdateExternalFeedforward(
++            CarMotionRx_GetFeedforwardAngleDeg(),
++            CarMotionRx_GetAccelerationMps2(),
++            CarMotionRx_IsMotionActive(now_ms));
+ 
+         /* I2C can wait for a few milliseconds, so it intentionally stays in main. */
+         ImuFeedforward_Process();
+diff -ruN '--exclude=Debug' balance/pinghengqiu/empty.syscfg pinghengqiu_req4/empty.syscfg
+--- balance/pinghengqiu/empty.syscfg	2026-07-31 17:34:34.000000000 +0000
++++ pinghengqiu_req4/empty.syscfg	2026-08-01 03:44:02.918709656 +0000
+@@ -26,6 +26,7 @@
+ const UART          = scripting.addModule("/ti/driverlib/UART", {}, false);
+ const UART1         = UART.addInstance();
+ const UART2         = UART.addInstance();
++const UART3         = UART.addInstance();
+ const ProjectConfig = scripting.addModule("/ti/project_config/ProjectConfig");
+ const Board         = scripting.addModule("/ti/driverlib/Board", {}, false);
+ 
+@@ -164,6 +165,16 @@
+ UART2.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric3";
+ UART2.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric9";
+ 
++/* Car motion link: car PB6(TX) -> balance PB7(RX), 115200 8N1. */
++UART3.$name                    = "UART_1";
++UART3.targetBaudRate           = 115200;
++UART3.enabledInterrupts        = ["RX"];
++UART3.peripheral.$assign       = "UART1";
++UART3.peripheral.rxPin.$assign = "PB7";
++UART3.peripheral.txPin.$assign = "PB6";
++UART3.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric16";
++UART3.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric17";
++
+ SYSCTL.forceDefaultClkConfig = true;
+ SYSCTL.clockTreeEn           = true;
+ SYSCTL.MFPCLKEn              = true;

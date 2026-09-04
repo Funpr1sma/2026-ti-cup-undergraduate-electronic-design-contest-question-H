@@ -1,0 +1,861 @@
+diff -ruN '--exclude=Debug' car/lineCAR/CarMotionLink.c lineCAR_req4/CarMotionLink.c
+--- car/lineCAR/CarMotionLink.c	2026-08-01 10:11:56.000000000 +0000
++++ lineCAR_req4/CarMotionLink.c	2026-08-01 03:42:26.634713030 +0000
+@@ -1,180 +1,186 @@
+-#include "CarMotionLink.h"
+-
+-#include "Config/CarConfig.h"
+-#include "MotionPlanner.h"
+-#include "ti_msp_dl_config.h"
+-
+-#include <stdbool.h>
+-#include <stdint.h>
+-
+-#define CAR_MOTION_FRAME_SIZE        (9U)
+-#define CAR_MOTION_FRAME_HEAD_0      (0xA5U)
+-#define CAR_MOTION_FRAME_HEAD_1      (0x5AU)
+-
+-/*
+- * µ¥¸ö×Ö½ÚµÈ´ı·¢ËÍµÄ×î´óÑ­»·´ÎÊı¡£
+- *
+- * UARTÒì³£Ê±Ö±½Ó·ÅÆúµ±Ç°Ö¡£¬²»ÄÜ³¤ÆÚ×èÈû³µÁ¾¿ØÖÆ¡£
+- */
+-#define CAR_MOTION_TX_WAIT_LOOPS     (20000U)
+-
+-static uint8_t g_sequence;
+-static uint32_t g_lastSendMs;
+-static uint32_t g_txDropCount;
+-
+-static void WriteI16(uint8_t *out, int32_t value)
+-{
+-    uint16_t raw;
+-
+-    if (value > 32767)
+-    {
+-        value = 32767;
+-    }
+-    else if (value < -32768)
+-    {
+-        value = -32768;
+-    }
+-
+-    raw = (uint16_t)(int16_t)value;
+-
+-    /*
+-     * Ğ­ÒéÊ¹ÓÃĞ¡¶Ë¸ñÊ½¡£
+-     */
+-    out[0] = (uint8_t)raw;
+-    out[1] = (uint8_t)(raw >> 8U);
+-}
+-
+-static uint8_t CalculateChecksum(const uint8_t *frame)
+-{
+-    uint8_t checksum = 0U;
+-    uint8_t index;
+-
+-    for (index = 0U; index < 8U; index++)
+-    {
+-        checksum = (uint8_t)(checksum + frame[index]);
+-    }
+-
+-    return checksum;
+-}
+-
+-static bool SendByte(uint8_t value)
+-{
+-    uint32_t waitLoops = CAR_MOTION_TX_WAIT_LOOPS;
+-
+-    while (!DL_UART_Main_transmitDataCheck(
+-                UART_1_INST,
+-                value))
+-    {
+-        if (waitLoops == 0U)
+-        {
+-            return false;
+-        }
+-
+-        waitLoops--;
+-    }
+-
+-    return true;
+-}
+-
+-static bool SendFrame(const uint8_t *frame)
+-{
+-    uint8_t index;
+-
+-    for (index = 0U;
+-         index < CAR_MOTION_FRAME_SIZE;
+-         index++)
+-    {
+-        if (!SendByte(frame[index]))
+-        {
+-            return false;
+-        }
+-    }
+-
+-    return true;
+-}
+-
+-void CarMotionLink_Init(uint32_t nowMs)
+-{
+-    g_sequence = 0U;
+-    g_lastSendMs = nowMs;
+-    g_txDropCount = 0U;
+-}
+-
+-void CarMotionLink_Task(
+-    uint32_t nowMs,
+-    bool ready,
+-    bool running,
+-    bool emergency)
+-{
+-    MotionPlannerStatus_t motion;
+-    uint8_t frame[CAR_MOTION_FRAME_SIZE];
+-    uint8_t flags = 0U;
+-
+-    if ((uint32_t)(nowMs - g_lastSendMs) <
+-        CAR_MOTION_LINK_PERIOD_MS)
+-    {
+-        return;
+-    }
+-
+-    /*
+-     * ±£³Ö·¢ËÍÖÜÆÚÎÈ¶¨¡£
+-     */
+-    g_lastSendMs += CAR_MOTION_LINK_PERIOD_MS;
+-
+-    /*
+-     * Èç¹ûÖ÷Ñ­»·ÑÓ³ÙÌ«¾Ã£¬Ôò´Óµ±Ç°Ê±¼äÖØĞÂ¼ÆÊ±£¬
+-     * ²»Á¬Ğø²¹·¢´óÁ¿¾ÉÖ¡¡£
+-     */
+-    if ((uint32_t)(nowMs - g_lastSendMs) >=
+-        CAR_MOTION_LINK_PERIOD_MS)
+-    {
+-        g_lastSendMs = nowMs;
+-    }
+-
+-    motion = MotionPlanner_GetStatus();
+-
+-    /*
+-     * ½ô¼±×´Ì¬ÓµÓĞ×î¸ßÓÅÏÈ¼¶¡£
+-     *
+-     * EMERGENCYÓĞĞ§Ê±£¬²»ÔÙÍ¬Ê±·¢ËÍREADY»òRUNNING£¬
+-     * ±ÜÃâ¸ËÇò°åÊÕµ½»¥ÏàÃ¬¶ÜµÄ¿ØÖÆ×´Ì¬¡£
+-     */
+-    if (emergency)
+-    {
+-        flags = CAR_MOTION_FLAG_EMERGENCY;
+-    }
+-    else if (running)
+-    {
+-        flags = CAR_MOTION_FLAG_RUNNING;
+-    }
+-    else if (ready)
+-    {
+-        flags = CAR_MOTION_FLAG_READY;
+-    }
+-    else
+-    {
+-        flags = 0U;
+-    }
+-
+-    frame[0] = CAR_MOTION_FRAME_HEAD_0;
+-    frame[1] = CAR_MOTION_FRAME_HEAD_1;
+-    frame[2] = g_sequence++;
+-    frame[3] = flags;
+-
+-    WriteI16(
+-        &frame[4],
+-        motion.plannedCps
+-    );
+-
+-    WriteI16(
+-        &frame[6],
+-        motion.accelerationMmS2
+-    );
+-
+-    frame[8] = CalculateChecksum(frame);
+-
+-    if (!SendFrame(frame))
+-    {
+-        g_txDropCount++;
+-    }
++#include "CarMotionLink.h"
++
++#include "Config/CarConfig.h"
++#include "MotionPlanner.h"
++#include "ti_msp_dl_config.h"
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define CAR_MOTION_FRAME_SIZE        (9U)
++#define CAR_MOTION_FRAME_HEAD_0      (0xA5U)
++#define CAR_MOTION_FRAME_HEAD_1      (0x5AU)
++
++/*
++ * µ¥¸ö×Ö½ÚµÈ´ı·¢ËÍµÄ×î´óÑ­»·´ÎÊı¡£
++ *
++ * UARTÒì³£Ê±Ö±½Ó·ÅÆúµ±Ç°Ö¡£¬²»ÄÜ³¤ÆÚ×èÈû³µÁ¾¿ØÖÆ¡£
++ */
++#define CAR_MOTION_TX_WAIT_LOOPS     (20000U)
++
++static uint8_t g_sequence;
++static uint32_t g_lastSendMs;
++static uint32_t g_txDropCount;
++
++static void WriteI16(uint8_t *out, int32_t value)
++{
++    uint16_t raw;
++
++    if (value > 32767)
++    {
++        value = 32767;
++    }
++    else if (value < -32768)
++    {
++        value = -32768;
++    }
++
++    raw = (uint16_t)(int16_t)value;
++
++    /*
++     * Ğ­ÒéÊ¹ÓÃĞ¡¶Ë¸ñÊ½¡£
++     */
++    out[0] = (uint8_t)raw;
++    out[1] = (uint8_t)(raw >> 8U);
++}
++
++static uint8_t CalculateChecksum(const uint8_t *frame)
++{
++    uint8_t checksum = 0U;
++    uint8_t index;
++
++    for (index = 0U; index < 8U; index++)
++    {
++        checksum = (uint8_t)(checksum + frame[index]);
++    }
++
++    return checksum;
++}
++
++static bool SendByte(uint8_t value)
++{
++    uint32_t waitLoops = CAR_MOTION_TX_WAIT_LOOPS;
++
++    while (!DL_UART_Main_transmitDataCheck(
++                UART_1_INST,
++                value))
++    {
++        if (waitLoops == 0U)
++        {
++            return false;
++        }
++
++        waitLoops--;
++    }
++
++    return true;
++}
++
++static bool SendFrame(const uint8_t *frame)
++{
++    uint8_t index;
++
++    for (index = 0U;
++         index < CAR_MOTION_FRAME_SIZE;
++         index++)
++    {
++        if (!SendByte(frame[index]))
++        {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++void CarMotionLink_Init(uint32_t nowMs)
++{
++    g_sequence = 0U;
++    g_lastSendMs = nowMs;
++    g_txDropCount = 0U;
++}
++
++void CarMotionLink_Task(
++    uint32_t nowMs,
++    bool ready,
++    bool running,
++    bool emergency,
++    bool balanceMode)
++{
++    MotionPlannerStatus_t motion;
++    uint8_t frame[CAR_MOTION_FRAME_SIZE];
++    uint8_t flags = 0U;
++
++    if ((uint32_t)(nowMs - g_lastSendMs) <
++        CAR_MOTION_LINK_PERIOD_MS)
++    {
++        return;
++    }
++
++    /*
++     * ±£³Ö·¢ËÍÖÜÆÚÎÈ¶¨¡£
++     */
++    g_lastSendMs += CAR_MOTION_LINK_PERIOD_MS;
++
++    /*
++     * Èç¹ûÖ÷Ñ­»·ÑÓ³ÙÌ«¾Ã£¬Ôò´Óµ±Ç°Ê±¼äÖØĞÂ¼ÆÊ±£¬
++     * ²»Á¬Ğø²¹·¢´óÁ¿¾ÉÖ¡¡£
++     */
++    if ((uint32_t)(nowMs - g_lastSendMs) >=
++        CAR_MOTION_LINK_PERIOD_MS)
++    {
++        g_lastSendMs = nowMs;
++    }
++
++    motion = MotionPlanner_GetStatus();
++
++    /*
++     * ½ô¼±×´Ì¬ÓµÓĞ×î¸ßÓÅÏÈ¼¶¡£
++     *
++     * EMERGENCYÓĞĞ§Ê±£¬²»ÔÙÍ¬Ê±·¢ËÍREADY»òRUNNING£¬
++     * ±ÜÃâ¸ËÇò°åÊÕµ½»¥ÏàÃ¬¶ÜµÄ¿ØÖÆ×´Ì¬¡£
++     */
++    if (emergency)
++    {
++        flags = CAR_MOTION_FLAG_EMERGENCY;
++    }
++    else if (running)
++    {
++        flags = CAR_MOTION_FLAG_RUNNING;
++    }
++    else if (ready)
++    {
++        flags = CAR_MOTION_FLAG_READY;
++    }
++    else
++    {
++        flags = 0U;
++    }
++
++    if (balanceMode)
++    {
++        flags |= CAR_MOTION_FLAG_BALANCE_MODE;
++    }
++
++    frame[0] = CAR_MOTION_FRAME_HEAD_0;
++    frame[1] = CAR_MOTION_FRAME_HEAD_1;
++    frame[2] = g_sequence++;
++    frame[3] = flags;
++
++    WriteI16(
++        &frame[4],
++        motion.plannedCps
++    );
++
++    WriteI16(
++        &frame[6],
++        motion.accelerationMmS2
++    );
++
++    frame[8] = CalculateChecksum(frame);
++
++    if (!SendFrame(frame))
++    {
++        g_txDropCount++;
++    }
+ }
+\ No newline at end of file
+diff -ruN '--exclude=Debug' car/lineCAR/CarMotionLink.h lineCAR_req4/CarMotionLink.h
+--- car/lineCAR/CarMotionLink.h	2026-08-01 10:11:56.000000000 +0000
++++ lineCAR_req4/CarMotionLink.h	2026-08-01 03:42:26.634713030 +0000
+@@ -1,39 +1,43 @@
+-#ifndef HARDWARE_CAR_MOTION_LINK_H_
+-#define HARDWARE_CAR_MOTION_LINK_H_
+-
+-#include <stdbool.h>
+-#include <stdint.h>
+-
+-/*
+- * Ö¡¸ñÊ½£¬¹²9×Ö½Ú£º
+- *
+- * byte 0: 0xA5
+- * byte 1: 0x5A
+- * byte 2: sequence
+- * byte 3: flags
+- * byte 4: plannedCpsµÍ×Ö½Ú
+- * byte 5: plannedCps¸ß×Ö½Ú
+- * byte 6: accelerationMmS2µÍ×Ö½Ú
+- * byte 7: accelerationMmS2¸ß×Ö½Ú
+- * byte 8: byte0µ½byte7ÀÛ¼ÓĞ£ÑéºÍ
+- */
+-
+-/* Ğ¡³µÕıÔÚÔË¶¯¡£ */
+-#define CAR_MOTION_FLAG_RUNNING      (1U << 0)
+-
+-/* ½ô¼±Í£Ö¹»ò¹ÊÕÏ£¬¸ËÇò°å±ØĞëÍ£Ö¹¡£ */
+-#define CAR_MOTION_FLAG_EMERGENCY    (1U << 1)
+-
+-/* Ğ¡³µÒÑ¾­½ÓÊÕµ½Æô¶¯ÃüÁî£¬¸ËÇò°åÓ¦×öºÃÆô¶¯×¼±¸¡£ */
+-#define CAR_MOTION_FLAG_READY        (1U << 2)
+-
+-void CarMotionLink_Init(uint32_t nowMs);
+-
+-void CarMotionLink_Task(
+-    uint32_t nowMs,
+-    bool ready,
+-    bool running,
+-    bool emergency
+-);
+-
++#ifndef HARDWARE_CAR_MOTION_LINK_H_
++#define HARDWARE_CAR_MOTION_LINK_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/*
++ * Ö¡¸ñÊ½£¬¹²9×Ö½Ú£º
++ *
++ * byte 0: 0xA5
++ * byte 1: 0x5A
++ * byte 2: sequence
++ * byte 3: flags
++ * byte 4: plannedCpsµÍ×Ö½Ú
++ * byte 5: plannedCps¸ß×Ö½Ú
++ * byte 6: accelerationMmS2µÍ×Ö½Ú
++ * byte 7: accelerationMmS2¸ß×Ö½Ú
++ * byte 8: byte0µ½byte7ÀÛ¼ÓĞ£ÑéºÍ
++ */
++
++/* Ğ¡³µÕıÔÚÔË¶¯¡£ */
++#define CAR_MOTION_FLAG_RUNNING      (1U << 0)
++
++/* ½ô¼±Í£Ö¹»ò¹ÊÕÏ£¬¸ËÇò°å±ØĞëÍ£Ö¹¡£ */
++#define CAR_MOTION_FLAG_EMERGENCY    (1U << 1)
++
++/* Ğ¡³µÒÑ¾­½ÓÊÕµ½Æô¶¯ÃüÁî£¬¸ËÇò°åÓ¦×öºÃÆô¶¯×¼±¸¡£ */
++#define CAR_MOTION_FLAG_READY        (1U << 2)
++
++/* Frame belongs to the shared requirement-4/5/6 balance mission. */
++#define CAR_MOTION_FLAG_BALANCE_MODE (1U << 3)
++
++void CarMotionLink_Init(uint32_t nowMs);
++
++void CarMotionLink_Task(
++    uint32_t nowMs,
++    bool ready,
++    bool running,
++    bool emergency,
++    bool balanceMode
++);
++
+ #endif /* HARDWARE_CAR_MOTION_LINK_H_ */
+\ No newline at end of file
+diff -ruN '--exclude=Debug' car/lineCAR/Config/CarConfig.h lineCAR_req4/Config/CarConfig.h
+--- car/lineCAR/Config/CarConfig.h	2026-08-01 09:23:46.000000000 +0000
++++ lineCAR_req4/Config/CarConfig.h	2026-08-01 03:42:26.634713030 +0000
+@@ -180,11 +180,17 @@
+ /* ÔË¶¯¹æ»®Æ÷¸üĞÂÖÜÆÚ¡£ */
+ #define MOTION_PLANNER_PERIOD_MS        (20U)
+ 
+-/* Õı³£¼ÓËÙ¶È£¬µ¥Î»mm/s^2¡£ */
+-#define MOTION_ACCEL_MM_S2              (500L)
++/* Requirement 2 keeps the uploaded acceleration/deceleration profile. */
++#define MOTION_REQ2_ACCEL_MM_S2          (500L)
++#define MOTION_REQ2_DECEL_MM_S2          (800L)
+ 
+-/* Õı³£¼õËÙ¶È£¬µ¥Î»mm/s^2¡£ */
+-#define MOTION_DECEL_MM_S2              (800L)
++/*
++ * Requirements 4/5/6 use a gentler launch.  At 1500 CPS and the current
++ * 7000 count/m calibration, 220 mm/s^2 reaches cruise in about 0.97 s and
++ * the theoretical A-to-B travel time remains below 8 s.
++ */
++#define MOTION_BALANCE_ACCEL_MM_S2       (220L)
++#define MOTION_BALANCE_DECEL_MM_S2       (300L)
+ 
+ /* UART1ÔË¶¯×´Ì¬·¢ËÍÖÜÆÚ¡£ */
+ #define CAR_MOTION_LINK_PERIOD_MS       (20U)
+diff -ruN '--exclude=Debug' car/lineCAR/H2026_REQ4_CAR_ACCEL_LINK_README.md lineCAR_req4/H2026_REQ4_CAR_ACCEL_LINK_README.md
+--- car/lineCAR/H2026_REQ4_CAR_ACCEL_LINK_README.md	1970-01-01 00:00:00.000000000 +0000
++++ lineCAR_req4/H2026_REQ4_CAR_ACCEL_LINK_README.md	2026-08-01 03:51:31.582693938 +0000
+@@ -0,0 +1,52 @@
++# H2026 è¦æ±‚4ï¼šå°è½¦å¹³æ»‘èµ·æ­¥ä¸åŠ é€Ÿåº¦å‘é€
++
++## ä¿ç•™åŠŸèƒ½
++
++- è¦æ±‚2çš„åŸºç¡€é€Ÿåº¦ã€å¯åœçº¿ã€è®¡æ—¶ã€é™é€Ÿå’Œåœè½¦çŠ¶æ€æœºæœªæ”¹ã€‚
++- è¦æ±‚4/5/6ä»ç”± PB11 æˆ– PB10 å¯åŠ¨è¿ç»­å¾ªè¿¹ï¼ŒåŸºç¡€é€Ÿåº¦ä¿æŒ 1500 CPSã€‚
++
++## è¦æ±‚4æ–°å¢è¡Œä¸º
++
++è¦æ±‚4/5/6è¿ç»­æ¨¡å¼ä½¿ç”¨ç‹¬ç«‹è¿åŠ¨è§„åˆ’å‚æ•°ï¼š
++
++```c
++MOTION_BALANCE_ACCEL_MM_S2 = 220
++MOTION_BALANCE_DECEL_MM_S2 = 300
++```
++
++ä»¥å½“å‰ `CAR_ENCODER_COUNTS_PER_METER=7000` è®¡ç®—ï¼Œç›®æ ‡é€Ÿåº¦æ¯20mså¢åŠ 30 CPSï¼Œçº¦1.00sä»0å¹³æ»‘å¢åŠ åˆ°1500 CPSã€‚
++
++è¦æ±‚2ç»§ç»­ä½¿ç”¨åŸå·¥ç¨‹çš„ï¼š
++
++```c
++MOTION_REQ2_ACCEL_MM_S2 = 500
++MOTION_REQ2_DECEL_MM_S2 = 800
++```
++
++## æ¿é—´è¿æ¥
++
++```text
++å°è½¦æ¿ PB6 / UART1_TX  â”€â”€â”€â”€â”€>  å¹³è¡¡æ¿ PB7 / UART1_RX
++å°è½¦æ¿ GND             â”€â”€â”€â”€â”€>  å¹³è¡¡æ¿ GND
++```
++
++æ³¢ç‰¹ç‡115200ï¼Œ8N1ï¼Œæ¯20mså‘é€ä¸€å¸§ã€‚
++
++## 9å­—èŠ‚åè®®
++
++```text
++A5 5A SEQ FLAGS SPEED_L SPEED_H ACCEL_L ACCEL_H CHECKSUM
++```
++
++- `SPEED`ï¼šè¿åŠ¨è§„åˆ’å™¨å½“å‰ç›®æ ‡é€Ÿåº¦ï¼Œå•ä½CPSï¼Œæœ‰ç¬¦å·16ä½å°ç«¯ã€‚
++- `ACCEL`ï¼šè¿åŠ¨è§„åˆ’å™¨å½“å‰çºµå‘åŠ é€Ÿåº¦ï¼Œå•ä½mm/sÂ²ï¼Œæœ‰ç¬¦å·16ä½å°ç«¯ã€‚
++- `CHECKSUM`ï¼šå‰8å­—èŠ‚æ— ç¬¦å·ç´¯åŠ å–ä½8ä½ã€‚
++
++æ ‡å¿—ä½ï¼š
++
++- bit0ï¼šRUNNING
++- bit1ï¼šEMERGENCY
++- bit2ï¼šREADY
++- bit3ï¼šBALANCE_MODEï¼Œåªåœ¨è¦æ±‚4/5/6è¿ç»­æ¨¡å¼ç½®1
++
++å¹³è¡¡æ¿å¿…é¡»åŒæ—¶çœ‹åˆ°RUNNINGå’ŒBALANCE_MODEæ‰ä¼šä½¿ç”¨åŠ é€Ÿåº¦å‰é¦ˆï¼Œå› æ­¤è¦æ±‚2æ•°æ®ä¸ä¼šå‚ä¸æ»šçƒæ§åˆ¶ã€‚
+diff -ruN '--exclude=Debug' car/lineCAR/Hardware/CarControl.c lineCAR_req4/Hardware/CarControl.c
+--- car/lineCAR/Hardware/CarControl.c	2026-08-01 03:58:24.000000000 +0000
++++ lineCAR_req4/Hardware/CarControl.c	2026-08-01 03:42:26.634713030 +0000
+@@ -114,6 +114,22 @@
+     g_status.driveTimerRunning = false;
+ }
+ 
++static void MissionApplyMotionProfile(CarMissionMode_t mode)
++{
++    if (mode == CAR_MISSION_BALANCE_CONTINUOUS)
++    {
++        MotionPlanner_SetProfile(
++            MOTION_BALANCE_ACCEL_MM_S2,
++            MOTION_BALANCE_DECEL_MM_S2);
++    }
++    else
++    {
++        MotionPlanner_SetProfile(
++            MOTION_REQ2_ACCEL_MM_S2,
++            MOTION_REQ2_DECEL_MM_S2);
++    }
++}
++
+ static int32_t MissionDefaultBase(CarMissionMode_t mode)
+ {
+     switch (mode)
+@@ -483,6 +499,7 @@
+ 
+     ResetStableTimers();
+     DriveTimer_Reset();
++    MissionApplyMotionProfile(g_status.missionMode);
+     LineFollow_SetBaseCps(g_status.baseCps);
+     LineFollow_Disable();
+     SpeedPI_StopAll();
+@@ -546,6 +563,9 @@
+     }
+ 
+     g_straightTuning = true;
++    MotionPlanner_SetProfile(
++        MOTION_REQ2_ACCEL_MM_S2,
++        MOTION_REQ2_DECEL_MM_S2);
+     g_status.fault = CAR_FAULT_NONE;
+     g_status.baseCps = targetCps;
+     g_status.intersectionCount = 0U;
+@@ -615,6 +635,7 @@
+ 
+     g_status.missionMode = mode;
+     g_status.baseCps = MissionDefaultBase(mode);
++    MissionApplyMotionProfile(mode);
+     LineFollow_SetBaseCps(g_status.baseCps);
+ 
+     Serial_SendString("MISSION:");
+diff -ruN '--exclude=Debug' car/lineCAR/MotionPlanner.c lineCAR_req4/MotionPlanner.c
+--- car/lineCAR/MotionPlanner.c	2026-08-01 03:58:24.000000000 +0000
++++ lineCAR_req4/MotionPlanner.c	2026-08-01 03:42:26.634713030 +0000
+@@ -1,88 +1,103 @@
+-#include "MotionPlanner.h"
+-
+-#include "Config/CarConfig.h"
+-
+-#include <stdint.h>
+-
+-static MotionPlannerStatus_t g_motion;
+-static uint32_t g_lastUpdateMs;
+-
+-static int32_t CalculateStep(int32_t accelerationMmS2, uint32_t elapsedMs)
+-{
+-    int32_t step = (int32_t)(
+-        (int64_t)accelerationMmS2 *
+-        CAR_ENCODER_COUNTS_PER_METER *
+-        elapsedMs / 1000000LL);
+-
+-    return (step < 1) ? 1 : step;
+-}
+-
+-void MotionPlanner_Init(uint32_t nowMs)
+-{
+-    g_motion = (MotionPlannerStatus_t){0};
+-    g_lastUpdateMs = nowMs;
+-}
+-
+-void MotionPlanner_SetTargetCps(int32_t targetCps)
+-{
+-    g_motion.requestedCps = targetCps;
+-}
+-
+-int32_t MotionPlanner_Update(uint32_t nowMs)
+-{
+-    uint32_t elapsedMs;
+-    int32_t previous;
+-    int32_t step;
+-
+-    g_motion.updated = false;
+-    elapsedMs = (uint32_t)(nowMs - g_lastUpdateMs);
+-
+-    if (elapsedMs < MOTION_PLANNER_PERIOD_MS)
+-    {
+-        return g_motion.plannedCps;
+-    }
+-    elapsedMs = MOTION_PLANNER_PERIOD_MS;
+-    g_lastUpdateMs = nowMs;
+-    previous = g_motion.plannedCps;
+-
+-    if (g_motion.plannedCps < g_motion.requestedCps)
+-    {
+-        step = CalculateStep(MOTION_ACCEL_MM_S2, elapsedMs);
+-
+-        if ((g_motion.requestedCps - g_motion.plannedCps) <= step)
+-            g_motion.plannedCps = g_motion.requestedCps;
+-        else
+-            g_motion.plannedCps += step;
+-    }
+-    else if (g_motion.plannedCps > g_motion.requestedCps)
+-    {
+-        step = CalculateStep(MOTION_DECEL_MM_S2, elapsedMs);
+-
+-        if ((g_motion.plannedCps - g_motion.requestedCps) <= step)
+-            g_motion.plannedCps = g_motion.requestedCps;
+-        else
+-            g_motion.plannedCps -= step;
+-    }
+-
+-    g_motion.accelerationMmS2 = (int32_t)(
+-        (int64_t)(g_motion.plannedCps - previous) *
+-        1000000LL /
+-        ((int64_t)CAR_ENCODER_COUNTS_PER_METER * elapsedMs));
+-
+-    g_motion.updated = true;
+-    return g_motion.plannedCps;
+-}
+-
+-void MotionPlanner_Reset(uint32_t nowMs)
+-{
+-    g_motion.requestedCps = 0;
+-    g_motion.plannedCps = 0;
+-    g_motion.accelerationMmS2 = 0;
+-    g_motion.updated = true;
+-    g_lastUpdateMs = nowMs;
+-}
+-
+-MotionPlannerStatus_t MotionPlanner_GetStatus(void)
+-{
+-    return g_motion;
++#include "MotionPlanner.h"
++
++#include "Config/CarConfig.h"
++
++#include <stdint.h>
++
++static MotionPlannerStatus_t g_motion;
++static uint32_t g_lastUpdateMs;
++
++static int32_t CalculateStep(int32_t accelerationMmS2, uint32_t elapsedMs)
++{
++    int32_t step = (int32_t)(
++        (int64_t)accelerationMmS2 *
++        CAR_ENCODER_COUNTS_PER_METER *
++        elapsedMs / 1000000LL);
++
++    return (step < 1) ? 1 : step;
++}
++
++void MotionPlanner_Init(uint32_t nowMs)
++{
++    g_motion = (MotionPlannerStatus_t){0};
++    g_motion.accelerationLimitMmS2 = MOTION_REQ2_ACCEL_MM_S2;
++    g_motion.decelerationLimitMmS2 = MOTION_REQ2_DECEL_MM_S2;
++    g_lastUpdateMs = nowMs;
++}
++
++void MotionPlanner_SetTargetCps(int32_t targetCps)
++{
++    g_motion.requestedCps = targetCps;
++}
++
++void MotionPlanner_SetProfile(int32_t accelerationMmS2, int32_t decelerationMmS2)
++{
++    if (accelerationMmS2 < 1) {
++        accelerationMmS2 = 1;
++    }
++    if (decelerationMmS2 < 1) {
++        decelerationMmS2 = 1;
++    }
++
++    g_motion.accelerationLimitMmS2 = accelerationMmS2;
++    g_motion.decelerationLimitMmS2 = decelerationMmS2;
++}
++
++int32_t MotionPlanner_Update(uint32_t nowMs)
++{
++    uint32_t elapsedMs;
++    int32_t previous;
++    int32_t step;
++
++    g_motion.updated = false;
++    elapsedMs = (uint32_t)(nowMs - g_lastUpdateMs);
++
++    if (elapsedMs < MOTION_PLANNER_PERIOD_MS)
++    {
++        return g_motion.plannedCps;
++    }
++    elapsedMs = MOTION_PLANNER_PERIOD_MS;
++    g_lastUpdateMs = nowMs;
++    previous = g_motion.plannedCps;
++
++    if (g_motion.plannedCps < g_motion.requestedCps)
++    {
++        step = CalculateStep(g_motion.accelerationLimitMmS2, elapsedMs);
++
++        if ((g_motion.requestedCps - g_motion.plannedCps) <= step)
++            g_motion.plannedCps = g_motion.requestedCps;
++        else
++            g_motion.plannedCps += step;
++    }
++    else if (g_motion.plannedCps > g_motion.requestedCps)
++    {
++        step = CalculateStep(g_motion.decelerationLimitMmS2, elapsedMs);
++
++        if ((g_motion.plannedCps - g_motion.requestedCps) <= step)
++            g_motion.plannedCps = g_motion.requestedCps;
++        else
++            g_motion.plannedCps -= step;
++    }
++
++    g_motion.accelerationMmS2 = (int32_t)(
++        (int64_t)(g_motion.plannedCps - previous) *
++        1000000LL /
++        ((int64_t)CAR_ENCODER_COUNTS_PER_METER * elapsedMs));
++
++    g_motion.updated = true;
++    return g_motion.plannedCps;
++}
++
++void MotionPlanner_Reset(uint32_t nowMs)
++{
++    g_motion.requestedCps = 0;
++    g_motion.plannedCps = 0;
++    g_motion.accelerationMmS2 = 0;
++    g_motion.updated = true;
++    g_lastUpdateMs = nowMs;
++}
++
++MotionPlannerStatus_t MotionPlanner_GetStatus(void)
++{
++    return g_motion;
+ }
+\ No newline at end of file
+diff -ruN '--exclude=Debug' car/lineCAR/MotionPlanner.h lineCAR_req4/MotionPlanner.h
+--- car/lineCAR/MotionPlanner.h	2026-08-01 03:21:32.000000000 +0000
++++ lineCAR_req4/MotionPlanner.h	2026-08-01 03:42:26.634713030 +0000
+@@ -1,21 +1,24 @@
+-#ifndef HARDWARE_MOTION_PLANNER_H_
+-#define HARDWARE_MOTION_PLANNER_H_
+-
+-#include <stdbool.h>
+-#include <stdint.h>
+-
+-typedef struct
+-{
+-    int32_t requestedCps;
+-    int32_t plannedCps;
+-    int32_t accelerationMmS2;
+-    bool updated;
+-} MotionPlannerStatus_t;
+-
+-void MotionPlanner_Init(uint32_t nowMs);
+-void MotionPlanner_SetTargetCps(int32_t targetCps);
+-int32_t MotionPlanner_Update(uint32_t nowMs);
+-void MotionPlanner_Reset(uint32_t nowMs);
+-MotionPlannerStatus_t MotionPlanner_GetStatus(void);
+-
++#ifndef HARDWARE_MOTION_PLANNER_H_
++#define HARDWARE_MOTION_PLANNER_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef struct
++{
++    int32_t requestedCps;
++    int32_t plannedCps;
++    int32_t accelerationMmS2;
++    int32_t accelerationLimitMmS2;
++    int32_t decelerationLimitMmS2;
++    bool updated;
++} MotionPlannerStatus_t;
++
++void MotionPlanner_Init(uint32_t nowMs);
++void MotionPlanner_SetTargetCps(int32_t targetCps);
++void MotionPlanner_SetProfile(int32_t accelerationMmS2, int32_t decelerationMmS2);
++int32_t MotionPlanner_Update(uint32_t nowMs);
++void MotionPlanner_Reset(uint32_t nowMs);
++MotionPlannerStatus_t MotionPlanner_GetStatus(void);
++
+ #endif
+\ No newline at end of file
+diff -ruN '--exclude=Debug' car/lineCAR/lineCAR.c lineCAR_req4/lineCAR.c
+--- car/lineCAR/lineCAR.c	2026-08-01 10:11:56.000000000 +0000
++++ lineCAR_req4/lineCAR.c	2026-08-01 03:42:26.634713030 +0000
+@@ -133,6 +133,7 @@
+     bool ready;
+     bool running;
+     bool emergency;
++    bool balanceMode;
+     uint32_t nowMs;
+     uint32_t lastLedMs;
+     CarControlStatus_t carStatus;
+@@ -225,7 +226,15 @@
+                 !lineStatus.lineValid &&
+                 !lineStatus.replayingLastState
+             );
+-            CarMotionLink_Task(nowMs,ready,running,emergency);
++            balanceMode =
++                (carStatus.missionMode ==
++                    CAR_MISSION_BALANCE_CONTINUOUS);
++            CarMotionLink_Task(
++                nowMs,
++                ready,
++                running,
++                emergency,
++                balanceMode);
+         #if CAR_ENABLE_OLED != 0U
+             OLED_Task(nowMs);
+         #endif

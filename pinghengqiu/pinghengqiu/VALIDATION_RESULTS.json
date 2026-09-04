@@ -1,0 +1,51 @@
+{
+  "revision": "req3_stall_recovery_pb4_default_level_and_launch_pretilt",
+  "syntax_checks": {
+    "balance_changed_sources": "PASS clang -std=c11 -Wall -Wextra -Werror -fsyntax-only",
+    "car_changed_sources": "PASS clang -std=c11 -Wall -Wextra -Werror -fsyntax-only"
+  },
+  "source_checks": {
+    "protocol_pret_bit_match": true,
+    "ack_pret_bit_match": true,
+    "pb4_levelgo": true,
+    "motorstate_command": true,
+    "req3_cruise_028": true,
+    "stall_boost": true,
+    "car_waits_pret_ack": true,
+    "car_sends_launch_accel": true
+  },
+  "req3": {
+    "positive_leg": "unchanged",
+    "negative_cruise_deg": 0.28,
+    "stall_confirm_ms": 140,
+    "stall_boost_deg": 0.42,
+    "stall_exit_speed_cm_s": 0.9
+  },
+  "default_level": {
+    "pb4": "levelgo then automatic BallBalance_SetLevelZero after arrival",
+    "query_commands": [
+      "motorstate",
+      "mstate",
+      "levelstatus",
+      "mangle",
+      "angle"
+    ],
+    "set_commands": [
+      "levelsave",
+      "leveldefault=<raw_deg>",
+      "levelgo",
+      "levelto=<raw_deg>"
+    ]
+  },
+  "pretilt": {
+    "car_flag_bit": 4,
+    "ack_ready_bit": 5,
+    "launch_acceleration_mm_s2": 220,
+    "minimum_wait_ms": 220,
+    "timeout_ms": 900,
+    "default_feedforward_gain": 0.85,
+    "default_feedforward_limit_deg": 1.2,
+    "estimated_pretilt_deg": -1.0179,
+    "motor_ready_window_deg": 70.0
+  }
+}

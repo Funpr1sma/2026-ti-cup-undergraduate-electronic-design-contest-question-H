@@ -1,0 +1,22 @@
+修复内容：
+
+文件：ball_balance_control.c
+函数：BallBalance_GetSnapshot()
+
+问题：
+摄像头 UART 已持续收到有效帧，但平衡控制器未启动时，缓存 snapshot 中的
+measurement_sequence/current_ball_cm/measurement_timestamp_ms 不会更新。
+Vofa_CameraPositionValid() 读取该缓存，因此错误判定摄像头无效；要求 6 无法锁存
+当前位置，最终小车等待 READY 超时并发送 emergency。
+
+修改：
+BallBalance_GetSnapshot() 返回快照时，将上述三个字段覆盖为当前实时测量值。
+
+预期日志：
+按 PB5 后按小车 PB10：
+CAR_START request mission=6 target_latched=1 target=...cm
+CAR_REQ6 accepted: captured ball-center target=... cm; READY ACK enabled
+
+PB11：
+CAR_START request mission=45 target_latched=1 target=0.000cm
+CAR_REQ45 accepted: target=0 cm; READY ACK enabled
